@@ -1,4 +1,4 @@
-#!/usr/bin/python2
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 # vim:set shiftwidth=4 tabstop=4 expandtab:
 #
@@ -27,15 +27,10 @@ import signal
 import sys
 import traceback
 from collections import defaultdict
-try:
-    from itertools import izip
-except ImportError:
-    izip = zip
 
-# layman imports (>=2)
-import layman.config
-import layman.db
-import layman.remotedb
+from itertools import zip_longest
+
+import subprocess
 # packagekit imports
 from packagekit.backend import (
     PackageKitBaseBackend,
@@ -234,18 +229,64 @@ class PackageKitPortageMixin(object):
         sys.stdout = sys.__stdout__
         sys.stderr = sys.__stderr__
 
+    def _has_flag(self, flags, flag):
+        try:
+            return (flags & flag) == flag
+        except TypeError:
+            return flag in flags
+    
     def _is_only_trusted(self, transaction_flags):
-        return (TRANSACTION_FLAG_ONLY_TRUSTED in transaction_flags) or (
-            TRANSACTION_FLAG_SIMULATE in transaction_flags)
+        return self._has_flag(transaction_flags, TRANSACTION_FLAG_ONLY_TRUSTED)
 
     def _is_simulate(self, transaction_flags):
-        return TRANSACTION_FLAG_SIMULATE in transaction_flags
+        return self._has_flag(transaction_flags, TRANSACTION_FLAG_SIMULATE)
 
     def _is_only_download(self, transaction_flags):
-        return TRANSACTION_FLAG_ONLY_DOWNLOAD in transaction_flags
+        return self._has_flag(transaction_flags, TRANSACTION_FLAG_ONLY_DOWNLOAD)
 
-    def _is_repo_enabled(self, layman_db, repo_name):
-        return repo_name in layman_db.overlays.keys()
+    def _eselect_enabled_repos(self):
+        """Return a set of enabled repository names via eselect-repository."""
+        try:
+            out = subprocess.run(
+                ["eselect", "repository", "list", "-i"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+            repos = set()
+            for line in out.stdout.splitlines():
+                # Typical line:  [1]  gentoo (enabled)
+                parts = line.split()
+                if len(parts) >= 2:
+                    repos.add(parts[1])
+            return repos
+        except Exception:
+            return set()
+
+    def _eselect_all_repos(self):
+        """Return an ordered list of (name, enabled_bool) from eselect."""
+        try:
+            enabled = self._eselect_enabled_repos()
+            out = subprocess.run(
+                ["eselect", "repository", "list"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+            repos = []
+            for line in out.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    name = parts[1]
+                    repos.append((name, name in enabled))
+            return repos
+        except Exception:
+            return []
+
+    def _is_repo_enabled(self, repo_name):
+        return repo_name in self._eselect_enabled_repos()
 
     def _get_search_list(self, keys_list):
         '''
@@ -445,23 +486,10 @@ class PackageKitPortageMixin(object):
         self._elog_messages.append(message)
         self._error_message = message
 
-    def _send_merge_error(self, default):
-        # EAPI-2 compliant (at least)
-        # 'other' phase is ignored except this one, every phase should be there
-        if self._error_phase in ("setup", "unpack", "prepare", "configure",
-                                 "nofetch", "config", "info"):
-            error_type = ERROR_PACKAGE_FAILED_TO_CONFIGURE
-        elif self._error_phase in ("compile", "test"):
-            error_type = ERROR_PACKAGE_FAILED_TO_BUILD
-        elif self._error_phase in ("install", "preinst", "postinst",
-                                   "package"):
-            error_type = ERROR_PACKAGE_FAILED_TO_INSTALL
-        elif self._error_phase in ("prerm", "postrm"):
-            error_type = ERROR_PACKAGE_FAILED_TO_REMOVE
-        else:
-            error_type = default
+    def _send_merge_error(self, error_code):
+        # Only used when emerge returns non-zero exit code
+        self.error(error_code, "Installation failed")
 
-        self.error(error_type, self._error_message)
 
     def _get_file_list(self, cpv):
         cat, pv = portage.versions.catsplit(cpv)
@@ -512,7 +540,7 @@ class PackageKitPortageMixin(object):
             keys.extend(list(db._aux_cache_keys))
 
         if in_dict:
-            return dict(izip(keys, db.aux_get(cpv, keys)))
+            return dict(zip(keys, db.aux_get(cpv, keys)))
         else:
             return db.aux_get(cpv, keys)
 
@@ -571,8 +599,9 @@ class PackageKitPortageMixin(object):
                 licenses = "* -" + free_licenses
             backup_licenses = self.pvar.settings["ACCEPT_LICENSE"]
 
-            self.pvar.apply_settings({'ACCEPT_LICENSE': licences})
-            cpv_list = filter(_has_validLicense, cpv_list)
+            # fix typo: licences -> licenses
+            self.pvar.apply_settings({'ACCEPT_LICENSE': licenses})
+            cpv_list = list(filter(_has_validLicense, cpv_list))
             self.pvar.apply_settings({'ACCEPT_LICENSE': backup_licenses})
 
         return cpv_list
@@ -591,8 +620,7 @@ class PackageKitPortageMixin(object):
         cpv_dict = self._get_cpv_slotted(cpv_list)
 
         # slots are sorted (dict), revert them to have newest slots first
-        slots = cpv_dict.keys()
-        slots.reverse()
+        slots = sorted(cpv_dict.keys(), reverse=True)
 
         # empty cpv_list, cpv are now in cpv_dict and cpv_list gonna be repop
         cpv_list = []
@@ -699,11 +727,12 @@ class PackageKitPortageMixin(object):
         # if no keywords, check in package.keywords
         if not keywords:
             key_dict = self.pvar.settings.pkeywordsdict.get(
-                portage.dep.dep_getkey(cpv)
+                portage.versions.cpv_getkey(cpv)
             )
             if key_dict:
                 for keys in key_dict.values():
-                    keyword.extend(keys)
+                    # fix typo: keyword -> keywords
+                    keywords.extend(keys)
 
         if not keywords:
             keywords.append("no keywords")
@@ -778,7 +807,7 @@ class PackageKitPortageMixin(object):
         # remove cpv_input that may be added to the list
         def filter_cpv_input(x):
             return x.cpv not in cpv_input
-        return filter(filter_cpv_input, packages_list)
+        return list(filter(filter_cpv_input, packages_list))
 
 
 class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
@@ -914,13 +943,13 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
             return cpv[0] != 'installed'
 
         # removing packages going to be uninstalled
-        cpv_list = filter(_filter_uninstall, cpv_list)
+        cpv_list = list(filter(_filter_uninstall, cpv_list))
 
         # install filter
         if FILTER_INSTALLED in filters:
-            cpv_list = filter(_filter_installed, cpv_list)
+            cpv_list = list(filter(_filter_installed, cpv_list))
         if FILTER_NOT_INSTALLED in filters:
-            cpv_list = filter(_filter_not_installed, cpv_list)
+            cpv_list = list(filter(_filter_not_installed, cpv_list))
 
         # now we can change cpv_list to a real cpv list
         tmp_list = cpv_list[:]
@@ -945,7 +974,7 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         progress = PackagekitProgress(compute_equal_steps(pkgs))
         self.percentage(progress.percent)
 
-        for percentage, pkg in izip(progress, pkgs):
+        for percentage, pkg in zip(progress, pkgs):
             cpv = self._id_to_cpv(pkg)
 
             if not self._is_cpv_valid(cpv):
@@ -980,7 +1009,7 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         progress = PackagekitProgress(compute_equal_steps(pkgs))
         self.percentage(progress.percent)
 
-        for percentage, pkg in izip(progress, pkgs):
+        for percentage, pkg in zip(progress, pkgs):
             cpv = self._id_to_cpv(pkg)
 
             if not self._is_cpv_valid(cpv):
@@ -1008,7 +1037,7 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         cp_list = self._get_all_cp(filters)
         progress = PackagekitProgress(compute_equal_steps(cp_list))
 
-        for percentage, cp in izip(progress, cp_list):
+        for percentage, cp in zip(progress, cp_list):
             for cpv in self._get_all_cpv(cp, filters):
                 try:
                     self._package(cpv)
@@ -1020,34 +1049,19 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         self.percentage(100)
 
     def get_repo_list(self, filters):
-        """ Get list of repository.
-
-        Get the list of repository tagged as official and supported by current
-        setup of layman.
-
-        Adds a dummy entry for gentoo-x86 official tree even though it appears
-        in layman's listing nowadays.
-        """
+        """Get list of repositories (via eselect-repository)."""
         self.status(STATUS_INFO)
         self.allow_cancel(True)
         self.percentage(None)
 
-        conf = layman.config.BareConfig()
-        conf.set_option('quiet', True)
-        installed_layman_db = layman.db.DB(conf)
-        available_layman_db = layman.remotedb.RemoteDB(conf)
-
-        # 'gentoo' is a dummy repo
+        # Always include gentoo (dummy entry like original)
         self.repo_detail('gentoo', 'Gentoo Portage tree', True)
 
         if FILTER_NOT_DEVELOPMENT not in filters:
-            for repo_name, overlay in available_layman_db.overlays.items():
-                if overlay.is_official() and overlay.is_supported():
-                    self.repo_detail(
-                        repo_name,
-                        overlay.name,
-                        self._is_repo_enabled(installed_layman_db, repo_name)
-                    )
+            for repo_name, enabled in self._eselect_all_repos():
+                if repo_name == "gentoo":
+                    continue
+                self.repo_detail(repo_name, repo_name, enabled)
 
     def required_by(self, filters, pkgs, recursive):
         # TODO: manage non-installed package
@@ -1182,8 +1196,7 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
             dict_down = {}
 
             # candidate slots are installed slots
-            slots = cpv_dict_inst.keys()
-            slots.reverse()
+            slots = sorted(cpv_dict_inst.keys(), reverse=True)
 
             for s in slots:
                 cpv_list_updates = []
@@ -1328,6 +1341,7 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         self.status(STATUS_INSTALL)
 
         if simulate:
+            #self.percentage(100)
             return
 
         # get elog messages
@@ -1345,9 +1359,23 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         finally:
             self._unblock_output()
 
-        # when an error is found print error messages
-        if rval != os.EX_OK:
+        installed_ok = all(self._is_installed(cpv.lstrip('=')) for cpv in cpv_list)
+
+        if rval != os.EX_OK and not installed_ok:
+            # merge failed → real error
             self._send_merge_error(ERROR_PACKAGE_FAILED_TO_INSTALL)
+        else:
+            # merge succeeded → elog are just notes
+            for entry in self._elog_messages:
+                try:
+                    if isinstance(entry, tuple) and len(entry) == 2:
+                        pkg, msgs = entry
+                        for msg in msgs:
+                            self.message(MESSAGE_INFO, f"{pkg}: {msg}")
+                    else:
+                        self.message(MESSAGE_INFO, str(entry))
+                except Exception:
+                    pass
 
         # show elog messages and clean
         portage.elog.remove_listener(self._elog_listener)
@@ -1368,20 +1396,17 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
 
         myopts = {'--quiet': True}
 
-        conf = layman.config.BareConfig()
-        conf.set_option('quiet', True)
-        installed_layman_db = layman.db.DB(conf)
-
         if force:
             timestamp_path = os.path.join(self.pvar.settings["PORTDIR"],
                                           "metadata", "timestamp.chk")
             if os.access(timestamp_path, os.F_OK):
-                os.remove(timestamp_path)
+                try:
+                    os.remove(timestamp_path)
+                except Exception:
+                    pass
 
         try:
             self._block_output()
-            for overlay in installed_layman_db.overlays.keys():
-                installed_layman_db.sync(overlay)
             _emerge.actions.action_sync(self.pvar.settings, self.pvar.trees,
                                         self.pvar.mtimedb, myopts, "")
         except:
@@ -1516,54 +1541,26 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         self._elog_messages = []
 
     def repo_enable(self, repoid, enable):
-        # NOTES: use layman API >= 1.2.3
         self.status(STATUS_INFO)
         self.allow_cancel(True)
         self.percentage(None)
 
-        # special case: trying to work with gentoo repo
         if repoid == 'gentoo':
             if not enable:
                 self.error(ERROR_CANNOT_DISABLE_REPOSITORY,
                            "gentoo repository can't be disabled")
             return
 
-        conf = layman.config.BareConfig()
-        conf.set_option('quiet', True)
-        installed_layman_db = layman.db.DB(conf)
-        available_layman_db = layman.remotedb.RemoteDB(conf)
-
-        # check now for repoid so we don't have to do it after
-        if repoid not in available_layman_db.overlays.keys():
-            self.error(ERROR_REPO_NOT_FOUND,
-                       "Repository %s was not found" % repoid)
-            return
-
-        # disabling (removing) a db
-        # if repository already disabled, ignoring
-        if not enable and self._is_repo_enabled(installed_layman_db, repoid):
-            try:
-                installed_layman_db.delete(installed_layman_db.select(repoid))
-            except Exception as exc:
-                self.error(ERROR_INTERNAL_ERROR,
-                           "Failed to disable repository %s: %s" %
-                           (repoid, str(exc)))
-                return
-
-        # enabling (adding) a db
-        # if repository already enabled, ignoring
-        if enable and not self._is_repo_enabled(installed_layman_db, repoid):
-            try:
-                # TODO: clean the trick to prevent outputs from layman
-                self._block_output()
-                installed_layman_db.add(available_layman_db.select(repoid))
-                self._unblock_output()
-            except Exception as exc:
-                self._unblock_output()
-                self.error(ERROR_INTERNAL_ERROR,
-                           "Failed to enable repository %s: %s" %
-                           (repoid, str(exc)))
-                return
+        cmd = ["eselect", "repository", "enable" if enable else "disable", repoid]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            self.error(ERROR_INTERNAL_ERROR,
+                       "Failed to {action} repository {repoid}: {err}".format(
+                           action="enable" if enable else "disable",
+                           repoid=repoid,
+                           err=str(exc)
+                       ))
 
     def resolve(self, filters, pkgs):
         self.status(STATUS_QUERY)
@@ -1581,7 +1578,7 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         # specifications says "be case sensitive"
         s = re.compile(reg_expr)
 
-        for percentage, cp in izip(progress, cp_list):
+        for percentage, cp in zip(progress, cp_list):
             if s.match(cp):
                 for cpv in self._get_all_cpv(cp, filters):
                     self._package(cpv)
@@ -1601,7 +1598,7 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         progress = PackagekitProgress(compute_equal_steps(cp_list))
         self.percentage(progress.percent)
 
-        for percentage, cp in izip(progress, cp_list):
+        for percentage, cp in zip(progress, cp_list):
             # unfortunatelly, everything is related to cpv, not cp
             # can't filter cp
             cpv_list = []
@@ -1659,7 +1656,7 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         progress = PackagekitProgress(compute_equal_steps(values))
         self.percentage(progress.percent)
 
-        for percentage, key in izip(progress, values):
+        for percentage, key in zip(progress, values):
 
             if key[0] != "/":
                 is_full_path = False
@@ -1691,7 +1688,7 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         progress = PackagekitProgress(compute_equal_steps(cp_list))
         self.percentage(progress.percent)
 
-        for percentage, cp in izip(progress, cp_list):
+        for percentage, cp in zip(progress, cp_list):
             for group in groups:
                 if self._get_pk_group(cp) == group:
                     for cpv in self._get_all_cpv(cp, filters):
@@ -1735,7 +1732,7 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         progress = PackagekitProgress(compute_equal_steps(cp_list))
         self.percentage(progress.percent)
 
-        for percentage, cp in izip(progress, cp_list):
+        for percentage, cp in zip(progress, cp_list):
             if category_filter:
                 cat, pkg_name = portage.versions.catsplit(cp)
                 if cat != category_filter:
@@ -1849,7 +1846,6 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         self._elog_messages = []
 
         self._signal_config_update()
-
 
 def main():
     backend = PackageKitPortageBackend("")

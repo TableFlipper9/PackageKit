@@ -25,6 +25,7 @@
 
 static PkBackendSpawn *spawn = 0;
 static const gchar* BACKEND_FILE = "portageBackend.py";
+static const gchar* CUSTOM_FILE = "custom.py";
 
 void
 pk_backend_start_job (PkBackend *backend, PkBackendJob *job)
@@ -289,6 +290,7 @@ pk_backend_search_details (PkBackend *backend, PkBackendJob *job, PkBitfield fil
 	gchar *search;
 	filters_text = pk_filter_bitfield_to_string (filters);
 	search = g_strjoinv ("&", values);
+	// pk_backend_spawn_helper (spawn, job, CUSTOM_FILE, "search-details", filters_text, search, NULL);
 	pk_backend_spawn_helper (spawn, job, BACKEND_FILE, "search-details", filters_text, search, NULL);
 	g_free (filters_text);
 	g_free (search);
@@ -325,6 +327,7 @@ pk_backend_search_names (PkBackend *backend, PkBackendJob *job, PkBitfield filte
 	gchar *search;
 	filters_text = pk_filter_bitfield_to_string (filters);
 	search = g_strjoinv ("&", values);
+	//pk_backend_spawn_helper (spawn, job, CUSTOM_FILE, "search-name", filters_text, search, NULL);
 	pk_backend_spawn_helper (spawn, job, BACKEND_FILE, "search-name", filters_text, search, NULL);
 	g_free (filters_text);
 	g_free (search);
