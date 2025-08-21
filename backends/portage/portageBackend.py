@@ -1706,7 +1706,6 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         self.percentage(100)
 
     def search_name(self, filters, keys_list):
-        print(">>> [Python hook] custom_message() fired before search_name", file = sys.stderr)
         # searching for all keys in package name
         # also filtering by categories if categery is specified in a key
         # keys contain more than one category name, no results can be found
