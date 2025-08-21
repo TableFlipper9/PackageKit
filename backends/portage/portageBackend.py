@@ -802,10 +802,6 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         'unknown': GROUP_UNKNOWN,
     }
 
-    def custom_message(self, filters, values):
-        print(">>> [Python hook] custom_message() fired before search_name", file = sys.stderr)
-
-    
     def __sigquit(self, signum, frame):
         raise SystemExit(1)
 
@@ -1855,9 +1851,6 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         self._signal_config_update()
 
 def main():
-    if len(sys.argv) > 1 and sys.args[1] == "custom-message":
-        custom_message()
-        sys.exit(0)
     backend = PackageKitPortageBackend("")
     backend.dispatcher(sys.argv[1:])
 
