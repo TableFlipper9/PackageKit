@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
-
 import sys
 import re
-from itertools import zip_longest 
-import portage
-import portage.versions
+import signal
+import traceback
+from collections import defaultdict
 
-from packagekit.backend import PackageKitBaseBackend, get_package_id
-from packagekit.enums import STATUS_QUERY, INFO_INSTALLED, INFO_AVAILABLE
+from itertools import zip_longest
+
+from packagekit.backend import (
+    PackageKitBaseBackend,
+    get_package_id,
+    split_package_id,
+)
+from packagekit.enums import *
 from packagekit.progress import PackagekitProgress
 
-import inspect
-print(inspect.signature(PackageKitBaseBackend.package))
+import portage
+import portage.dep
+import portage.versions
+from portage.exception import InvalidAtom
 
 def compute_equal_steps(iterable):
     if not iterable:
@@ -20,7 +27,6 @@ def compute_equal_steps(iterable):
             for idx, _ in enumerate(iterable, start=1)]
 
 class PortageBackend(PackageKitBaseBackend):
-    open("/tmp/custom_helper_called", "a").write(f"called with {inspect.signature(PackageKitBaseBackend.package)}\n")
     def __init__(self, args):
         super().__init__(args)
 
@@ -30,30 +36,31 @@ class PortageBackend(PackageKitBaseBackend):
     def _get_all_cpv(self, cp, filters):
         return portage.db[portage.root]["porttree"].dbapi.match(cp)
 
-    def _package(self, cpv, info=None):
+    def _get_metadata(self, cpv, fields):
+        try:
+            return portage.db[portage.root]["porttree"].dbapi.aux_get(cpv, fields)
+        except Exception:
+            return ["" for _ in fields]
+
+    def _is_installed(self, cpv):
+        return bool(portage.db[portage.root]["vartree"].dbapi.match(cpv))
+
+    def _cpv_to_id(self, cpv):
         cp = portage.cpv_getkey(cpv)
         cat, pn = portage.catsplit(cp)
         ver = portage.versions.cpv_getversion(cpv)
+        repo = "gentoo"  # hardcoded for now
+        arch = portage.settings.get("ARCH", "amd64")
+        return get_package_id(pn, ver, arch, repo)
 
-        try:
-            keywords = portage.db[portage.root]["porttree"].dbapi.aux_get(cpv, ["KEYWORDS"])[0].split()
-            arch = keywords[0] if keywords else portage.settings.get("ARCH", "amd64")
-        except Exception:
-            arch = portage.settings.get("ARCH", "amd64")
-
-        repo = "gentoo"
-        pkgid = get_package_id(pn, ver, arch, repo)
-
-        try:
-            desc = portage.db[portage.root]["porttree"].dbapi.aux_get(cpv, ["DESCRIPTION"])[0]
-        except Exception:
-            desc = ""
-
-        if info is None:
-            info = INFO_AVAILABLE
-
-        # Correct Python 3 signature
-        self.package(pkgid, info, desc)
+    def _package(self, cpv, info=None):
+        desc = self._get_metadata(cpv, ["DESCRIPTION"])[0]
+        if not info:
+            if self._is_installed(cpv):
+                info = INFO_INSTALLED
+            else:
+                info = INFO_AVAILABLE
+        self.package(self._cpv_to_id(cpv), info, desc)
 
     def search_name(self, filters, keys_list):
         self.status(STATUS_QUERY)
@@ -79,9 +86,9 @@ class PortageBackend(PackageKitBaseBackend):
 
         cp_list = self._get_all_cp(filters)
 
-        progress = compute_equal_steps(cp_list)
-        self.percentage(0)
-
+        progress = PackagekitProgress(compute_equal_steps(cp_list))
+        self.percentage(progress.percent)
+        
         for percentage, cp in zip(progress, cp_list):
             if category_filter:
                 cat, pkg_name = portage.versions.catsplit(cp)
