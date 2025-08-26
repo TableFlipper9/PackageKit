@@ -229,15 +229,20 @@ class PackageKitPortageMixin(object):
         sys.stdout = sys.__stdout__
         sys.stderr = sys.__stderr__
 
+    def _has_flag(self, flags, flag):
+        try:
+            return (flags & flag) == flag
+        except TypeError:
+            return flag in flags
+    
     def _is_only_trusted(self, transaction_flags):
-        return (TRANSACTION_FLAG_ONLY_TRUSTED in transaction_flags) or (
-            TRANSACTION_FLAG_SIMULATE in transaction_flags)
+        return self._has_flag(transaction_flags, TRANSACTION_FLAG_ONLY_TRUSTED)
 
     def _is_simulate(self, transaction_flags):
-        return TRANSACTION_FLAG_SIMULATE in transaction_flags
+        return self._has_flag(transaction_flags, TRANSACTION_FLAG_SIMULATE)
 
     def _is_only_download(self, transaction_flags):
-        return TRANSACTION_FLAG_ONLY_DOWNLOAD in transaction_flags
+        return self._has_flag(transaction_flags, TRANSACTION_FLAG_ONLY_DOWNLOAD)
 
     def _eselect_enabled_repos(self):
         """Return a set of enabled repository names via eselect-repository."""
@@ -481,23 +486,10 @@ class PackageKitPortageMixin(object):
         self._elog_messages.append(message)
         self._error_message = message
 
-    def _send_merge_error(self, default):
-        # EAPI-2 compliant (at least)
-        # 'other' phase is ignored except this one, every phase should be there
-        if self._error_phase in ("setup", "unpack", "prepare", "configure",
-                                 "nofetch", "config", "info"):
-            error_type = ERROR_PACKAGE_FAILED_TO_CONFIGURE
-        elif self._error_phase in ("compile", "test"):
-            error_type = ERROR_PACKAGE_FAILED_TO_BUILD
-        elif self._error_phase in ("install", "preinst", "postinst",
-                                   "package"):
-            error_type = ERROR_PACKAGE_FAILED_TO_INSTALL
-        elif self._error_phase in ("prerm", "postrm"):
-            error_type = ERROR_PACKAGE_FAILED_TO_REMOVE
-        else:
-            error_type = default
+    def _send_merge_error(self, error_code):
+        # Only used when emerge returns non-zero exit code
+        self.error(error_code, "Installation failed")
 
-        self.error(error_type, self._error_message)
 
     def _get_file_list(self, cpv):
         cat, pv = portage.versions.catsplit(cpv)
@@ -1349,6 +1341,7 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         self.status(STATUS_INSTALL)
 
         if simulate:
+            #self.percentage(100)
             return
 
         # get elog messages
@@ -1366,9 +1359,23 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         finally:
             self._unblock_output()
 
-        # when an error is found print error messages
-        if rval != os.EX_OK:
+        installed_ok = all(self._is_installed(cpv.lstrip('=')) for cpv in cpv_list)
+
+        if rval != os.EX_OK and not installed_ok:
+            # merge failed → real error
             self._send_merge_error(ERROR_PACKAGE_FAILED_TO_INSTALL)
+        else:
+            # merge succeeded → elog are just notes
+            for entry in self._elog_messages:
+                try:
+                    if isinstance(entry, tuple) and len(entry) == 2:
+                        pkg, msgs = entry
+                        for msg in msgs:
+                            self.message(MESSAGE_INFO, f"{pkg}: {msg}")
+                    else:
+                        self.message(MESSAGE_INFO, str(entry))
+                except Exception:
+                    pass
 
         # show elog messages and clean
         portage.elog.remove_listener(self._elog_listener)
