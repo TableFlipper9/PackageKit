@@ -693,18 +693,48 @@ class PackageKitPortageMixin(object):
         # - free: ok
         # - newest: ok
 
-        cpv_list = []
+        installed_cpvs = list(self.pvar.vardb.match(cp))
+        available_cpvs = [x for x in self.pvar.portdb.match(cp)
+                        if not self._is_installed(x)]
 
-        # populate cpv_list taking care of installed filter
+        # Build mapping slot -> newest installed CPV
+        installed_newest_by_slot = {}
+        if installed_cpvs:
+            inst_slots = self._get_cpv_slotted(installed_cpvs)
+            for slot, cpvs in inst_slots.items():
+                # choose newest among installed cpvs for that slot
+                best = cpvs[0]
+                for c in cpvs:
+                    if self._cmp_cpv(c, best) == 1:
+                        best = c
+                installed_newest_by_slot[slot] = best
+
+        # drop any available CPV that is older to newest installed
+        filtered_available = []
+        for cpv in available_cpvs:
+            try:
+                slot = self._get_metadata(cpv, ["SLOT"])[0]
+            except Exception:
+                # if cant determine slot, keep the CPV
+                filtered_available.append(cpv)
+                continue
+
+            inst = installed_newest_by_slot.get(slot)
+            if inst and self._cmp_cpv(cpv, inst) <= 0:
+                continue
+            filtered_available.append(cpv)
+
+        # decide what to return depending on filters
         if FILTER_INSTALLED in filters:
-            cpv_list = self.pvar.vardb.match(cp)
+            cpv_list = installed_cpvs
         elif FILTER_NOT_INSTALLED in filters:
-            cpv_list = [cpv for cpv in self.pvar.portdb.match(cp)
-                        if not self._is_installed(cpv)]
+            cpv_list = filtered_available
         else:
-            cpv_list = self.pvar.vardb.match(cp)
-            cpv_list.extend(self.pvar.portdb.match(cp))
-            cpv_list = set(cpv_list)
+            cpv_list = []
+            cpv_list.extend(installed_cpvs)
+            for x in filtered_available:
+                if x not in cpv_list:
+                    cpv_list.append(x)
 
         # free filter
         cpv_list = self._filter_free(cpv_list, filters)
@@ -714,6 +744,7 @@ class PackageKitPortageMixin(object):
             cpv_list = self._filter_newest(cpv_list, filters)
 
         return cpv_list
+
 
     def _id_to_cpv(self, pkgid):
         '''
@@ -1901,77 +1932,68 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         self.percentage(None)
 
         cpv_list = []
-
         for pkg in pkgs:
             cpv = self._id_to_cpv(pkg)
-
             if not self._is_cpv_valid(cpv):
-                self.error(ERROR_UPDATE_NOT_FOUND,
-                           "Package %s was not found" % pkg)
+                self.error(ERROR_UPDATE_NOT_FOUND, f"Package {pkg} not found")
                 continue
+            cpv_list.append("=" + cpv)
 
-            cpv_list.append('=' + cpv)
+        if not cpv_list:
+            return
 
         # only_trusted isn't supported
         # but better to show it after important errors
         if only_trusted:
-            self.error(ERROR_MISSING_GPG_SIGNATURE,
-                       "Portage backend does not support GPG signature")
+            self.error(ERROR_MISSING_GPG_SIGNATURE,"Portage backend does not support GPG signature")
             return
 
-        # creating update depgraph
         myopts = {}
+        if simulate:
+            myopts["--pretend"] = True
         if only_download:
-            myopts['--fetchonly'] = True
-        favorites = []
-        myparams = _emerge.create_depgraph_params \
-            .create_depgraph_params(myopts, "")
+            myopts["--fetchonly"] = True
 
         self.status(STATUS_DEP_RESOLVE)
+        myparams = create_depgraph_params(myopts, "upgrade")
+        dep = depgraph(self.pvar.settings, self.pvar.trees, myopts, myparams, None)
 
-        depgraph = _emerge.depgraph.depgraph(self.pvar.settings,
-                                             self.pvar.trees, myopts,
-                                             myparams, None)
-        retval, favorites = depgraph.select_files(cpv_list)
+        retval, favorites = dep.select_files(cpv_list)
         if not retval:
-            self.error(ERROR_DEP_RESOLUTION_FAILED,
-                       "Wasn't able to get dependency graph")
+            self.error(ERROR_DEP_RESOLUTION_FAILED, "Wasn't able to get update depgraph")
             return
 
-        # check fetch restrict, can stop the function via error signal
-        self._check_fetch_restrict(depgraph.altlist())
+        altlist = dep.altlist()
+        if not altlist:
+            self.error(ERROR_DEP_RESOLUTION_FAILED, f"Empty update list for {cpv_list}")
+            return
+
+        #self.message(MESSAGE_INFO, f"About to update: {[x.cpv for x in altlist]}")
+
+        self._check_fetch_restrict(altlist)
 
         self.status(STATUS_INSTALL)
-
         if simulate:
             return
 
-        # get elog messages
+        import portage.elog
         portage.elog.add_listener(self._elog_listener)
-
         try:
-            self._block_output()
-            # compiling/installing
-            mergetask = _emerge.Scheduler.Scheduler(
+            mergetask = Scheduler(
                 self.pvar.settings, self.pvar.trees, self.pvar.mtimedb,
-                myopts, None, depgraph.altlist(), favorites,
-                depgraph.schedulerGraph()
+                myopts, None, altlist, favorites,
+                dep.schedulerGraph()
             )
             rval = mergetask.merge()
         finally:
-            self._unblock_output()
+            portage.elog.remove_listener(self._elog_listener)
 
-        # when an error is found print error messages
         if rval != os.EX_OK:
             self._send_merge_error(ERROR_PACKAGE_FAILED_TO_INSTALL)
 
-        # show elog messages and clean
-        portage.elog.remove_listener(self._elog_listener)
-        # for msg in self._elog_messages:
-        #    self.message(MESSAGE_UNKNOWN, msg)
         self._elog_messages = []
-
         self._signal_config_update()
+        self.pvar.update()
 
 def main():
     backend = PackageKitPortageBackend("")
