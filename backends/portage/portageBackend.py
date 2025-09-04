@@ -41,9 +41,18 @@ from packagekit.enums import *
 from packagekit.progress import PackagekitProgress
 # portage imports
 import _emerge.AtomArg
-import _emerge.actions
-import _emerge.create_depgraph_params
-import _emerge.stdout_spinner
+
+# old
+#import _emerge.actions
+#import _emerge.create_depgraph_params
+
+# new
+from _emerge.actions import load_emerge_config
+from _emerge.create_depgraph_params import create_depgraph_params
+from _emerge.depgraph import depgraph
+from _emerge.Scheduler import Scheduler
+from _emerge.stdout_spinner import stdout_spinner
+
 import portage
 import portage.dep
 import portage.versions
@@ -377,7 +386,11 @@ class PackageKitPortageMixin(object):
         return self.pvar.vardb.cpv_exists(cpv)
 
     def _is_cpv_valid(self, cpv):
-        return any([self._is_installed(cpv), self.pvar.portdb.cpv_exists(cpv)])
+        if self._is_installed(cpv):
+            return True
+        return self.pvar.portdb.cpv_exists(cpv)
+
+
 
     def _get_real_license_str(self, cpv, metadata):
         # use conditionals info (w/ USE) in LICENSE and remove ||
@@ -486,9 +499,20 @@ class PackageKitPortageMixin(object):
         self._elog_messages.append(message)
         self._error_message = message
 
-    def _send_merge_error(self, error_code):
-        # Only used when emerge returns non-zero exit code
-        self.error(error_code, "Installation failed")
+    def _send_merge_error(self, default):
+        if self._error_phase in ("setup", "unpack", "prepare", "configure",
+                                 "nofetch", "config", "info"):
+            error_type = ERROR_PACKAGE_FAILED_TO_CONFIGURE
+        elif self._error_phase in ("compile", "test"):
+            error_type = ERROR_PACKAGE_FAILED_TO_BUILD
+        elif self._error_phase in ("install", "preinst", "postinst",
+                                   "package"):
+            error_type = ERROR_PACKAGE_FAILED_TO_INSTALL
+        elif self._error_phase in ("prerm", "postrm"):
+            error_type = ERROR_PACKAGE_FAILED_TO_REMOVE
+        else:
+            error_type = default
+        self.error(error_type, self._error_message)
 
 
     def _get_file_list(self, cpv):
@@ -706,9 +730,17 @@ class PackageKitPortageMixin(object):
                        " a category")
 
         # remove slot info from version field
+        cp = ret[0]
         version = ret[1].split(':')[0]
 
-        return ret[0] + "-" + version
+        # Portage requires revision as separate field, e.g. -r10
+        m = re.match(r"(.+)-r(\d+)$", version)
+        if m:
+            basever, rev = m.groups()
+            return f"{cp}-{basever}-r{rev}"
+        else:
+            return f"{cp}-{version}"
+
 
     def _cpv_to_id(self, cpv):
         '''
@@ -1279,112 +1311,206 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         return self._install_packages(only_trusted, pkgs, simulate=simulate,
                                       only_download=only_download)
 
-    def _install_packages(self, only_trusted, pkgs, simulate=False,
-                          only_download=False):
-        # NOTES:
-        # can't install an already installed packages
-        # even if it happens to be needed in Gentoo but probably not this API
-        # TODO: every merged pkg should emit self.package()
-        #       see around _emerge.Scheduler.Scheduler
+    def _install_packages(self, only_trusted, pkgs, simulate=False, only_download=False):
+        """
+        Install packages using the same depgraph + scheduler sequence as emerge.
+        """
 
         self.status(STATUS_RUNNING)
         self.allow_cancel(False)
         self.percentage(None)
 
         cpv_list = []
-
         for pkg in pkgs:
             cpv = self._id_to_cpv(pkg)
-
             if not self._is_cpv_valid(cpv):
-                self.error(ERROR_PACKAGE_NOT_FOUND,
-                           "Package %s was not found" % pkg)
+                self.error(ERROR_PACKAGE_NOT_FOUND, f"Package {pkg} not found or not visible")
                 continue
-
             if self._is_installed(cpv):
-                self.error(ERROR_PACKAGE_ALREADY_INSTALLED,
-                           "Package %s is already installed" % pkg)
+                self.error(ERROR_PACKAGE_ALREADY_INSTALLED, f"Package {pkg} is already installed")
                 continue
+            cpv_list.append("=" + cpv)
 
-            cpv_list.append('=' + cpv)
+        if not cpv_list:
+            return
 
-        # only_trusted isn't supported
-        # but better to show it after important errors
         if only_trusted:
-            self.error(ERROR_MISSING_GPG_SIGNATURE,
-                       "Portage backend does not support GPG signature")
+            self.error(ERROR_MISSING_GPG_SIGNATURE, "Portage backend does not support GPG signature verification")
             return
 
-        # creating installation depgraph
+        from _emerge.main import parse_opts
+        import traceback
+        import shlex
+
         myopts = {}
-        if only_download:
-            myopts['--fetchonly'] = True
-
-        favorites = []
-        myparams = _emerge.create_depgraph_params \
-            .create_depgraph_params(myopts, "")
-
-        self.status(STATUS_DEP_RESOLVE)
-
-        depgraph = _emerge.depgraph.depgraph(self.pvar.settings,
-                                             self.pvar.trees, myopts,
-                                             myparams, None)
-        retval, favorites = depgraph.select_files(cpv_list)
-        if not retval:
-            self.error(ERROR_DEP_RESOLUTION_FAILED,
-                       "Wasn't able to get dependency graph")
-            return
-
-        # check fetch restrict, can stop the function via error signal
-        self._check_fetch_restrict(depgraph.altlist())
-
-        self.status(STATUS_INSTALL)
-
-        if simulate:
-            #self.percentage(100)
-            return
-
-        # get elog messages
-        portage.elog.add_listener(self._elog_listener)
 
         try:
-            self._block_output()
-            # compiling/installing
-            mergetask = _emerge.Scheduler.Scheduler(
-                self.pvar.settings, self.pvar.trees, self.pvar.mtimedb,
-                myopts, None, depgraph.altlist(), favorites,
-                depgraph.schedulerGraph()
+            emerge_config = load_emerge_config()
+            tmpcmdline = []
+            tmpcmdline.extend(
+                shlex.split(
+                    emerge_config.target_config.settings.get("EMERGE_DEFAULT_OPTS", "")
+                )
             )
-            rval = mergetask.merge()
-        finally:
-            self._unblock_output()
+            # parse defaults like emerge does
+            emerge_config.action, emerge_config.opts, emerge_config.args = parse_opts(tmpcmdline)
+            self.pvar.settings = emerge_config.target_config.settings
+            myopts = emerge_config.opts
+        except BaseException as e:
+            self.error(ERROR_PACKAGE_FAILED_TO_INSTALL, f"parse_opts exploded: {type(e).__name__}: {e}")
 
-        installed_ok = all(self._is_installed(cpv.lstrip('=')) for cpv in cpv_list)
+        myopts["--with-bdeps"] = "y"
 
-        if rval != os.EX_OK and not installed_ok:
-            # merge failed → real error
-            self._send_merge_error(ERROR_PACKAGE_FAILED_TO_INSTALL)
-        else:
-            # merge succeeded → elog are just notes
-            for entry in self._elog_messages:
+        getbin = bool(myopts.get("--getbinpkg"))
+        getbinonly = bool(myopts.get("--getbinpkgonly"))
+
+        # both flags set -> error and stop
+        if getbin and getbinonly:
+            self.error(ERROR_DEP_RESOLUTION_FAILED, "Invalid options: both --getbinpkg and --getbinpkgonly are set.")
+            return
+
+        root = self.pvar.settings['ROOT']
+        bintree = self.pvar.trees[root].get('bintree')
+
+        if getbin:
+            myopts["--usepkg"] = True
+            myopts.pop("--getbinpkgonly", None)
+            if bintree:
                 try:
-                    if isinstance(entry, tuple) and len(entry) == 2:
-                        pkg, msgs = entry
-                        for msg in msgs:
-                            self.message(MESSAGE_INFO, f"{pkg}: {msg}")
-                    else:
-                        self.message(MESSAGE_INFO, str(entry))
+                    bintree.populate(getbinpkgs=True)
+                except Exception as e:
+                    # not fatal: scheduler will fall back to source if needed
+                    self.message(MESSAGE_INFO, f"bintree.populate(getbinpkg) failed: {e}")
+
+        elif getbinonly:
+            myopts["--usepkgonly"] = True
+            myopts.pop("--getbinpkg", None)
+            if bintree:
+                try:
+                    bintree.populate(getbinpkgs=True, getbinpkgonly=True)
+                except Exception as e:
+                    # fatal: only binpkgs
+                    self.error(ERROR_PACKAGE_FAILED_TO_INSTALL, f"No binary packages available: {e}")
+                    return
+        else:
+            # neither flag
+            myopts.pop("--getbinpkg", None)
+            myopts.pop("--getbinpkgonly", None)
+            myopts.pop("--usepkg", None)
+            myopts.pop("--usepkgonly", None)
+
+        if simulate:
+            myopts["--pretend"] = True
+        if only_download:
+            myopts["--fetchonly"] = True
+
+        # resolve deps (first attempt)
+        self.status(STATUS_DEP_RESOLVE)
+        myparams = create_depgraph_params(myopts, "")
+        dep = depgraph(self.pvar.settings, self.pvar.trees, myopts, myparams, None)
+
+        retval, favorites = dep.select_files(cpv_list)
+        if not retval:
+            self.error(ERROR_DEP_RESOLUTION_FAILED, "Wasn't able to get dependency graph")
+            return
+
+        altlist = dep.altlist()
+        try:
+            alt_cpvs = [getattr(x, "cpv", str(x)) for x in altlist]
+            self.message(MESSAGE_INFO, f"dep.altlist: {alt_cpvs}")
+            self.message(MESSAGE_INFO, f"favorites: {favorites}")
+        except Exception:
+            pass
+
+        if not altlist:
+            if getbinonly:
+                self.error(ERROR_DEP_RESOLUTION_FAILED,
+                        "No binary candidates found and --getbinpkgonly was requested; aborting.")
+                return
+            elif getbin:
+                try:
+                    self.message(MESSAGE_INFO, "No binary candidates found; falling back to source builds.")
                 except Exception:
                     pass
 
-        # show elog messages and clean
-        portage.elog.remove_listener(self._elog_listener)
-        # for msg in self._elog_messages:
-        # XXX: Message are removed so we will remove this
-        #        self.message(MESSAGE_UNKNOWN, msg)
-        self._elog_messages = []
+                myopts_fallback = dict(myopts)
+                myopts_fallback.pop("--usepkg", None)
+                myopts_fallback.pop("--usepkgonly", None)
 
+                # re-create depgraph and re-resolve
+                myparams_fb = create_depgraph_params(myopts_fallback, "")
+                dep_fb = depgraph(self.pvar.settings, self.pvar.trees, myopts_fallback, myparams_fb, None)
+                retval2, favorites2 = dep_fb.select_files(cpv_list)
+                if not retval2:
+                    self.error(ERROR_DEP_RESOLUTION_FAILED, "Wasn't able to get dependency graph (fallback to source).")
+                    return
+
+                altlist = dep_fb.altlist()
+                try:
+                    alt_cpvs = [getattr(x, "cpv", str(x)) for x in altlist]
+                    self.message(MESSAGE_INFO, f"dep.altlist (fallback): {alt_cpvs}")
+                    self.message(MESSAGE_INFO, f"favorites (fallback): {favorites2}")
+                except Exception:
+                    pass
+
+                if not altlist:
+                    self.error(ERROR_DEP_RESOLUTION_FAILED, "Resolver produced an empty merge list for: " + ", ".join(cpv_list))
+                    return
+
+                dep = dep_fb
+                favorites = favorites2
+            else:
+                self.error(ERROR_DEP_RESOLUTION_FAILED, "Resolver produced an empty merge list for: " + ", ".join(cpv_list))
+                return
+
+        self.message("info", f"About to merge: {[getattr(x,'cpv',x) for x in altlist]}")
+
+        # fetch restrictions
+        self._check_fetch_restrict(altlist)
+
+        self.status(STATUS_INSTALL)
+        if simulate:
+            return
+
+        os.environ.setdefault("PATH","/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/bin:/usr/lib/llvm/20/bin:/usr/lib/llvm/19/bin:/usr/lib/llvm/18/bin:/opt/vmware/bin:/opt/vmware/sbin:/etc/eselect/wine/bin:/opt/cuda/bin:/var/lib/snapd/snap/bin")
+        os.environ.setdefault("HOME", "/var/lib/portage")
+        os.environ.setdefault("USER", "portage")
+        os.environ.setdefault("LOGNAME", "portage")
+
+        # run scheduler
+        import portage.elog
+        portage.elog.add_listener(self._elog_listener)
+        try:
+            #self._block_output()
+            mergetask = Scheduler(
+                self.pvar.settings, self.pvar.trees, self.pvar.mtimedb,
+                myopts, None, dep.altlist(), favorites,
+                dep.schedulerGraph()
+            )
+            rval = mergetask.merge()
+        finally:
+            #self._unblock_output()
+            portage.elog.remove_listener(self._elog_listener)
+
+        # refresh portage internal state
+        try:
+            self.pvar.update()
+        except Exception:
+            self.message("info", "Warning: failed to refresh internal portage state")
+
+        # validate result
+        for entry in self._elog_messages:
+            try:
+                self.message(MESSAGE_INFO, str(entry))
+            except Exception:
+                pass
+        installed_ok = all(self._is_installed(cpv.lstrip('=')) for cpv in cpv_list)
+        if rval != os.EX_OK and not installed_ok:
+            self._send_merge_error(ERROR_PACKAGE_FAILED_TO_INSTALL)
+
+        self._elog_messages = []
         self._signal_config_update()
+
 
     def refresh_cache(self, force):
         # NOTES: can't manage progress even if it could be better
