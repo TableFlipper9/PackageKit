@@ -1575,127 +1575,133 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         return self._remove_packages(transaction_flags, pkgs, allowdep, autoremove)
 
     def _remove_packages(self, transaction_flags, pkgs, allowdep, autoremove):
-        # TODO: every to-be-removed pkg should emit self.package()
-        #       see around _emerge.Scheduler.Scheduler
+        """
+        Remove packages using depgraph + Scheduler, like emerge --unmerge.
+
+        """
+
         self.status(STATUS_RUNNING)
         self.allow_cancel(False)
         self.percentage(None)
 
         simulate = self._is_simulate(transaction_flags)
 
-        cpv_list = []
-        packages = []
-        required_packages = []
-        system_packages = []
+        # collect system packages for safeguard
+        system_packages = [
+            atom.cp for atom in InternalPackageSet(
+                initial_atoms=self.pvar.root_config.setconfig.getSetAtoms("system")
+            )
+        ]
 
-        # get system packages
-        for atom in InternalPackageSet(initial_atoms=self.pvar.root_config
-                                       .setconfig.getSetAtoms("system")):
-            system_packages.append(atom.cp)
-
-        # create cpv_list
+        atoms = []
         for pkg in pkgs:
             cpv = self._id_to_cpv(pkg)
 
             if not self._is_cpv_valid(cpv):
-                self.error(ERROR_PACKAGE_NOT_FOUND,
-                           "Package %s was not found" % pkg)
+                self.error(ERROR_PACKAGE_NOT_FOUND, f"Package {pkg} was not found")
                 continue
 
             if not self._is_installed(cpv):
-                self.error(ERROR_PACKAGE_NOT_INSTALLED,
-                           "Package %s is not installed" % pkg)
+                self.error(ERROR_PACKAGE_NOT_INSTALLED, f"Package {pkg} is not installed")
                 continue
 
-            # stop removal if a package is in the system set
-            if portage.versions.pkgsplit(cpv)[0] in system_packages:
+            if portage.versions.cpv_getkey(cpv) in system_packages:
                 self.error(
                     ERROR_CANNOT_REMOVE_SYSTEM_PACKAGE,
-                    "Package %s is a system package. "
-                    "If you really want to remove it, please use portage" %
-                    pkg
+                    f"Package {pkg} is a system package. "
+                    "Use emerge directly if you really want to remove it."
                 )
                 continue
 
-            cpv_list.append(cpv)
+            # If user explicitly gave =cat/pkg-ver, keep it
+            if pkg.startswith("="):
+                atoms.append("=" + cpv)
+            else:
+                atoms.append(portage.versions.cpv_getkey(cpv))
 
-        # backend do not implement autoremove
-        # if autoremove:
-        #    self.message(MESSAGE_AUTOREMOVE_IGNORED,
-        #                 "Portage backend do not implement autoremove option")
-
-        # get packages needing candidates for removal
-        required_packages = self._get_required_packages(cpv_list,
-                                                        recursive=True)
-
-        # if there are required packages, allowdep must be on
-        if required_packages and not allowdep:
-            self.error(ERROR_DEP_RESOLUTION_FAILED,
-                       "Could not perform remove operation has packages "
-                       "are needed by other packages")
+        if not atoms:
             return
 
-        # first, we add required packages
-        for p in required_packages:
-            package = _emerge.Package.Package(
-                type_name=p.type_name,
-                built=p.built,
-                installed=p.installed,
-                root_config=p.root_config,
-                cpv=p.cpv,
-                metadata=p.metadata,
-                operation='uninstall'
-            )
-            packages.append(package)
+        from _emerge.main import parse_opts
+        import shlex
 
-        # and now, packages we want really to remove
-        for cpv in cpv_list:
-            metadata = self._get_metadata(cpv, [],
-                                          in_dict=True, add_cache_keys=True)
-            package = _emerge.Package.Package(
-                type_name="ebuild",
-                built=True,
-                installed=True,
-                root_config=self.pvar.root_config,
-                cpv=cpv,
-                metadata=metadata,
-                operation="uninstall"
+        try:
+            emerge_config = load_emerge_config()
+            tmpcmdline = shlex.split(
+                emerge_config.target_config.settings.get("EMERGE_DEFAULT_OPTS", "")
             )
-            packages.append(package)
+            emerge_config.action, emerge_config.opts, emerge_config.args = parse_opts(tmpcmdline)
+            self.pvar.settings = emerge_config.target_config.settings
+            myopts = emerge_config.opts
+        except BaseException as e:
+            self.error(ERROR_PACKAGE_FAILED_TO_REMOVE,
+                       f"parse_opts exploded: {type(e).__name__}: {e}")
+            return
 
+        if simulate:
+            myopts["--pretend"] = True
+
+        # depgraph for unmerge
+        self.status(STATUS_DEP_RESOLVE)
+        myparams = create_depgraph_params(myopts, "unmerge")
+        dep = depgraph(self.pvar.settings, self.pvar.trees, myopts, myparams, None)
+
+        retval, favorites = dep.select_files(atoms)
+        if not retval:
+            self.error(ERROR_DEP_RESOLUTION_FAILED,
+                       "Could not resolve removal targets")
+            return
+
+        altlist = dep.altlist()
+        if not altlist:
+            self.error(ERROR_DEP_RESOLUTION_FAILED,
+                       "Resolver produced empty remove list for: " + ", ".join(atoms))
+            return
+
+        self.error(ERROR_DEP_RESOLUTION_FAILED,
+             f"altlist: {[getattr(x,'cpv',x) for x in altlist]} "
+             f"ops: {[getattr(x,'operation','?') for x in altlist]}")
+
+
+        self.status(STATUS_REMOVE)
         if simulate:
             return
 
-        # need to define favorites to remove packages from world set
-        favorites = []
-        for p in packages:
-            favorites.append('=' + p.cpv)
+        os.environ.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/bin")
+        os.environ.setdefault("HOME", "/var/lib/portage")
+        os.environ.setdefault("USER", "portage")
+        os.environ.setdefault("LOGNAME", "portage")
 
-        # get elog messages
+        # run scheduler
         portage.elog.add_listener(self._elog_listener)
-
-        # now, we can remove
         try:
-            self._block_output()
-            mergetask = _emerge.Scheduler.Scheduler(
-                self.pvar.settings, self.pvar.trees, self.pvar.mtimedb,
-                mergelist=packages, myopts={}, spinner=None,
-                favorites=favorites, digraph=None
+            mergetask = Scheduler(
+                self.pvar.settings,
+                self.pvar.trees,
+                self.pvar.mtimedb,
+                myopts,
+                None,
+                altlist,
+                favorites,
+                dep.schedulerGraph()
             )
             rval = mergetask.merge()
         finally:
-            self._unblock_output()
+            portage.elog.remove_listener(self._elog_listener)
 
-        # when an error is found print error messages
+        # refresh portage state
+        try:
+            self.pvar.update()
+        except Exception:
+            self.message(MESSAGE_INFO,
+                         "Warning: failed to refresh internal portage state after removal")
+
         if rval != os.EX_OK:
             self._send_merge_error(ERROR_PACKAGE_FAILED_TO_REMOVE)
 
-        # show elog messages and clean
-        portage.elog.remove_listener(self._elog_listener)
-        # for msg in self._elog_messages:
-        #     XXX: Message no loger exists so we will remove this
-        #     self.message(MESSAGE_UNKNOWN, msg)
         self._elog_messages = []
+        self._signal_config_update()
+
 
     def repo_enable(self, repoid, enable):
         self.status(STATUS_INFO)
