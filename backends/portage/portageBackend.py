@@ -181,16 +181,81 @@ class PortageBridge():
         self.mtimedb = None
         self.vardb = None
         self.portdb = None
+        self.bindb = None
         self.root_config = None
+        self.myopts = None
 
         self.update()
+        os.environ.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/bin")
+        os.environ.setdefault("HOME", "/var/lib/portage")
+        os.environ.setdefault("USER", "portage")
+        os.environ.setdefault("LOGNAME", "portage")
+
+    def handle_binpkg(self):
+        from _emerge.main import parse_opts
+        import shlex
+
+        try:
+            emerge_config = load_emerge_config()
+            tmpcmdline = []
+            tmpcmdline.extend(
+                shlex.split(
+                    emerge_config.target_config.settings.get("EMERGE_DEFAULT_OPTS", "")
+                )
+            )
+            emerge_config.action, emerge_config.opts, emerge_config.args = parse_opts(tmpcmdline)
+            self.settings = emerge_config.target_config.settings
+            self.myopts = emerge_config.opts
+        except BaseException as e:
+            self.error(ERROR_PACKAGE_FAILED_TO_INSTALL, f"parse_opts exploded: {type(e).__name__}: {e}")
+
+        getbin = bool(self.myopts.get("--getbinpkg"))
+        getbinonly = bool(self.myopts.get("--getbinpkgonly"))
+
+        # both flags set -> error and stop
+        if getbin and getbinonly:
+            self.error(ERROR_DEP_RESOLUTION_FAILED, "Invalid options: both --getbinpkg and --getbinpkgonly are set.")
+            return
+
+        root = self.settings['ROOT']
+        bintree = self.trees[root].get('bintree')
+
+        if getbin:
+            self.myopts["--usepkg"] = True
+            self.myopts.pop("--getbinpkgonly", None)
+            if bintree:
+                try:
+                    bintree.populate(getbinpkgs=True)
+                except Exception as e:
+                    # not fatal: scheduler will fall back to source if needed
+                    self.message(MESSAGE_INFO, f"bintree.populate(getbinpkg) failed: {e}")
+
+        elif getbinonly:
+            self.myopts["--usepkgonly"] = True
+            self.myopts.pop("--getbinpkg", None)
+            if bintree:
+                try:
+                    bintree.populate(getbinpkgs=True)
+                except Exception as e:
+                    # fatal: only binpkgs
+                    self.error(ERROR_PACKAGE_FAILED_TO_INSTALL, f"No binary packages available: {e}")
+                    return
+        else:
+            # neither flag
+            self.myopts.pop("--getbinpkg", None)
+            self.myopts.pop("--getbinpkgonly", None)
+            self.myopts.pop("--usepkg", None)
+            self.myopts.pop("--usepkgonly", None)
 
     def update(self):
         self.settings, self.trees, self.mtimedb = \
             _emerge.actions.load_emerge_config()
         self.vardb = self.trees[self.settings['ROOT']]['vartree'].dbapi
         self.portdb = self.trees[self.settings['ROOT']]['porttree'].dbapi
+        self.bindb = self.trees[self.settings['ROOT']]['bintree'].dbapi
         self.root_config = self.trees[self.settings['ROOT']]['root_config']
+
+        self.handle_binpkg()
 
         self.apply_settings({
             # we don't want interactive ebuilds
@@ -227,6 +292,7 @@ class PackageKitPortageMixin(object):
         self._elog_messages = []
         self._error_message = ""
         self._error_phase = ""
+        self._buildid_cache = {}
 
     # TODO: should be removed when using non-verbose function API
     def _block_output(self):
@@ -383,13 +449,26 @@ class PackageKitPortageMixin(object):
         return settings
 
     def _is_installed(self, cpv):
-        return self.pvar.vardb.cpv_exists(cpv)
+        base = self._strip_buildid_for_db(cpv)
+        return self.pvar.vardb.cpv_exists(base)
 
     def _is_cpv_valid(self, cpv):
-        if self._is_installed(cpv):
+        base = self._strip_buildid_for_db(cpv)
+        if self._is_installed(base):
             return True
-        return self.pvar.portdb.cpv_exists(cpv)
+        try:
+            if self.pvar.bindb.cpv_exists(base):
+                return True
+        except Exception:
+            pass
+        return self.pvar.portdb.cpv_exists(base)
 
+    def _is_binpkg(self, cpv):
+        base = self._strip_buildid_for_db(cpv)
+        try:
+            return self.pvar.bindb.cpv_exists(base)
+        except Exception:
+            return False
 
 
     def _get_real_license_str(self, cpv, metadata):
@@ -499,6 +578,91 @@ class PackageKitPortageMixin(object):
         self._elog_messages.append(message)
         self._error_message = message
 
+    def _extract_buildid(self, cpv):
+        """
+        If cpv ends with an integer build-id suffix (after optional -rN),
+        return (base_cpv, build_id_int). Otherwise return (cpv, None).
+        """
+        if not cpv or "-" not in cpv:
+            return (cpv, None)
+
+        m = re.match(r"^(?P<base>.+?)-(?P<last>\d+)$", cpv)
+        if not m:
+            return (cpv, None)
+
+        base_candidate = m.group("base")
+        bid_candidate = int(m.group("last"))
+
+        try:
+            if (self.pvar.vardb.cpv_exists(base_candidate)
+                    or self.pvar.portdb.cpv_exists(base_candidate)
+                    or self.pvar.bindb.cpv_exists(base_candidate)):
+                return (base_candidate, bid_candidate)
+        except Exception:
+            return (base_candidate, bid_candidate)
+
+        return (cpv, None)
+
+    def _strip_buildid_for_db(self, cpv):
+        """
+        Return the base CPV suitable for DB lookups.
+        """
+        base, _ = self._extract_buildid(cpv)
+        return base
+
+    def _list_binpkg_buildids(self, base_cpv):
+        """
+        Return sorted list of build IDs available for base_cpv.
+        Combines local PKGDIR scan and bindb (remote binhost metadata).
+        """
+        if base_cpv in self._buildid_cache:
+            return self._buildid_cache[base_cpv]
+
+        bids = set()
+
+        try:
+            package, version, rev = portage.versions.pkgsplit(base_cpv)
+            pn = package.split("/", 1)[1]
+            pf = pn + "-" + version
+            if rev != "r0":
+                pf = pf + "-r" + rev
+        except Exception:
+            self._buildid_cache[base_cpv] = []
+            return []
+
+        pkgdirs_raw = self.pvar.settings.get("PKGDIR", "") or ""
+        pkgdirs = pkgdirs_raw.split() if isinstance(pkgdirs_raw, str) else pkgdirs_raw
+
+        for pkgdir in pkgdirs:
+            cat, pn = package.split("/", 1)
+            candidate_dir = os.path.join(pkgdir, cat, pn)
+            if not os.path.isdir(candidate_dir):
+                continue
+            for fname in os.listdir(candidate_dir):
+                if not (fname.endswith((".tbz2", ".tbz", ".tb2", ".xpak", ".gpkg.tar"))):
+                    continue
+                if fname.startswith(pf + "-"):
+                    bid_str = fname[len(pf) + 1:].split(".")[0]
+                    if bid_str.isdigit():
+                        bids.add(int(bid_str))
+
+        try:
+            for cpv in self.pvar.bindb.match(base_cpv):
+                try:
+                    build_id_str = self.pvar.bindb.aux_get(cpv, ["BUILD_ID"])[0]
+                    if build_id_str and build_id_str.isdigit():
+                        bids.add(int(build_id_str))
+                except Exception:
+                    continue
+        except Exception:
+            # fall back: no bindb data
+            pass
+
+        bids_list = sorted(bids)
+        self._buildid_cache[base_cpv] = bids_list
+        return bids_list
+
+
     def _send_merge_error(self, default):
         if self._error_phase in ("setup", "unpack", "prepare", "configure",
                                  "nofetch", "config", "info"):
@@ -558,15 +722,42 @@ class PackageKitPortageMixin(object):
         If in_dict is True, metadata is returned in a dict object.
         If add_cache_keys is True, cached keys are added to keys in parameter.
         '''
-        db = self.pvar.vardb if self._is_installed(cpv) else self.pvar.portdb
+        base_cpv, build_id = self._extract_buildid(cpv)
 
-        if add_cache_keys:
-            keys.extend(list(db._aux_cache_keys))
+        if self._is_installed(base_cpv):
+            db = self.pvar.vardb
+        elif self._is_binpkg(base_cpv):
+            db = self.pvar.bindb
+        else:
+            db = self.pvar.portdb
+
+        try:
+            res = db.aux_get(base_cpv, keys)
+        except Exception:
+            if in_dict:
+                return dict(zip(keys, ("",) * len(keys)))
+            else:
+                return tuple("" for _ in keys)
+
+        if "BUILD_ID" in keys and build_id is not None:
+            if in_dict:
+                res = dict(zip(keys, res)) if not isinstance(res, dict) else dict(res)
+                res["BUILD_ID"] = str(build_id)
+            else:
+                tmp = list(res)
+                idx = keys.index("BUILD_ID")
+                tmp[idx] = str(build_id)
+                res = tuple(tmp)
 
         if in_dict:
-            return dict(zip(keys, db.aux_get(cpv, keys)))
+            if not isinstance(res, dict):
+                return dict(zip(keys, res))
+            return res
         else:
-            return db.aux_get(cpv, keys)
+            if isinstance(res, dict):
+                return tuple(res.get(k, "") for k in keys)
+            return res
+
 
     def _get_size(self, cpv):
         '''
@@ -681,6 +872,9 @@ class PackageKitPortageMixin(object):
             for cp in self.pvar.portdb.cp_all():
                 if cp not in cp_list:
                     cp_list.append(cp)
+            for cp in self.pvar.bindb.cp_all():
+                if cp not in cp_list:
+                    cp_list.append(cp)
 
         return cp_list
 
@@ -692,54 +886,25 @@ class PackageKitPortageMixin(object):
         # - installed: ok
         # - free: ok
         # - newest: ok
-
         installed_cpvs = list(self.pvar.vardb.match(cp))
         available_cpvs = [x for x in self.pvar.portdb.match(cp)
-                        if not self._is_installed(x)]
+                          if not self._is_installed(x)]
+        bin_cpvs = [x for x in self.pvar.bindb.match(cp)
+                    if not self._is_installed(x)]
 
-        # Build mapping slot -> newest installed CPV
-        installed_newest_by_slot = {}
-        if installed_cpvs:
-            inst_slots = self._get_cpv_slotted(installed_cpvs)
-            for slot, cpvs in inst_slots.items():
-                # choose newest among installed cpvs for that slot
-                best = cpvs[0]
-                for c in cpvs:
-                    if self._cmp_cpv(c, best) == 1:
-                        best = c
-                installed_newest_by_slot[slot] = best
-
-        # drop any available CPV that is older to newest installed
-        filtered_available = []
-        for cpv in available_cpvs:
-            try:
-                slot = self._get_metadata(cpv, ["SLOT"])[0]
-            except Exception:
-                # if cant determine slot, keep the CPV
-                filtered_available.append(cpv)
-                continue
-
-            inst = installed_newest_by_slot.get(slot)
-            if inst and self._cmp_cpv(cpv, inst) <= 0:
-                continue
-            filtered_available.append(cpv)
-
-        # decide what to return depending on filters
         if FILTER_INSTALLED in filters:
             cpv_list = installed_cpvs
         elif FILTER_NOT_INSTALLED in filters:
-            cpv_list = filtered_available
+            cpv_list = available_cpvs + bin_cpvs
         else:
             cpv_list = []
             cpv_list.extend(installed_cpvs)
-            for x in filtered_available:
+            for x in bin_cpvs + available_cpvs:
                 if x not in cpv_list:
                     cpv_list.append(x)
 
-        # free filter
         cpv_list = self._filter_free(cpv_list, filters)
 
-        # newest filter
         if filter_newest:
             cpv_list = self._filter_newest(cpv_list, filters)
 
@@ -759,28 +924,34 @@ class PackageKitPortageMixin(object):
             self.error(ERROR_PACKAGE_ID_INVALID,
                        "The first field of the package id must contain"
                        " a category")
-
-        # remove slot info from version field
         cp = ret[0]
         version = ret[1].split(':')[0]
 
-        # Portage requires revision as separate field, e.g. -r10
+        m_rev_build = re.match(r"(.+)-r(\d+)-(\d+)$", version)
+        if m_rev_build:
+            basever, rev, bid = m_rev_build.groups()
+            return f"{cp}-{basever}-r{rev}-{bid}"
+
+        m_build = re.match(r"(.+)-(\d+)$", version)
+        if m_build:
+            basever, bid = m_build.groups()
+            return f"{cp}-{basever}-{bid}"
+
         m = re.match(r"(.+)-r(\d+)$", version)
         if m:
             basever, rev = m.groups()
             return f"{cp}-{basever}-r{rev}"
-        else:
-            return f"{cp}-{version}"
+
+        return f"{cp}-{version}"
 
 
     def _cpv_to_id(self, cpv):
         '''
         Transform the cpv (portage) to a package id (packagekit)
         '''
+
         package, version, rev = portage.versions.pkgsplit(cpv)
-        pkg_keywords, repo, slot = self._get_metadata(
-            cpv, ["KEYWORDS", "repository", "SLOT"]
-        )
+        pkg_keywords, repo_meta, slot = self._get_metadata(cpv, ["KEYWORDS", "repository", "SLOT"])
 
         # filter accepted keywords
         keywords = list(set(pkg_keywords.split()).intersection(
@@ -794,26 +965,31 @@ class PackageKitPortageMixin(object):
             )
             if key_dict:
                 for keys in key_dict.values():
-                    # fix typo: keyword -> keywords
                     keywords.extend(keys)
 
         if not keywords:
             keywords.append("no keywords")
-            # self.message(MESSAGE_UNKNOWN,
-            #             "No keywords have been found for %s" % cpv)
 
-        # don't want to see -r0
         if rev != "r0":
             version = version + "-" + rev
-        # add slot info if slot != 0
+
+        build_id = getattr(self, "_selected_build_id", None)
+        if build_id is not None:
+            version = version + "-" + str(build_id)
+
         if slot != '0':
             version = version + ':' + slot
 
-        # if installed, repo should be 'installed', packagekit rule
         if self._is_installed(cpv):
             repo = "installed"
+        elif self._is_binpkg(cpv):
+            repo = "binpkg"
+        else:
+            repo = repo_meta
 
         return get_package_id(package, version, ' '.join(keywords), repo)
+
+
 
     def _get_required_packages(self, cpv_input, recursive):
         '''
@@ -909,7 +1085,21 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
                 info = INFO_INSTALLED
             else:
                 info = INFO_AVAILABLE
+
+        prev_bid = getattr(self, "_selected_build_id", None)
+
+        self._selected_build_id = None
         self.package(self._cpv_to_id(cpv), info, desc)
+
+        # emit per-build-id entries for binpkgs
+        if self._is_binpkg(cpv) and not self._is_installed(cpv):
+            bids = self._list_binpkg_buildids(cpv)
+            for bid in bids:
+                self._selected_build_id = bid
+                self.package(self._cpv_to_id(cpv), info, desc)
+
+        self._selected_build_id = prev_bid
+
 
     def get_categories(self):
 
