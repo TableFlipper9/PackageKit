@@ -59,6 +59,11 @@ import portage.versions
 from portage._sets.base import InternalPackageSet
 from portage.exception import InvalidAtom
 
+from _emerge.main import parse_opts
+import traceback
+import shlex
+import portage.elog
+
 # NOTES:
 #
 # Package IDs description:
@@ -184,6 +189,7 @@ class PortageBridge():
         self.bindb = None
         self.root_config = None
         self.myopts = None
+        self._allow_binpkgs = False
 
         self.update()
         os.environ.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/bin")
@@ -192,9 +198,6 @@ class PortageBridge():
         os.environ.setdefault("LOGNAME", "portage")
 
     def handle_binpkg(self):
-        from _emerge.main import parse_opts
-        import shlex
-
         try:
             emerge_config = load_emerge_config()
             tmpcmdline = []
@@ -211,6 +214,8 @@ class PortageBridge():
 
         getbin = bool(self.myopts.get("--getbinpkg"))
         getbinonly = bool(self.myopts.get("--getbinpkgonly"))
+
+        self._allow_binpkgs = getbin or getbinonly
 
         # both flags set -> error and stop
         if getbin and getbinonly:
@@ -310,6 +315,12 @@ class PackageKitPortageMixin(object):
         except TypeError:
             return flag in flags
     
+    def _is_allow_downgrade(self, transaction_flags):
+        return self._has_flag(transaction_flags, TRANSACTION_FLAG_ALLOW_DOWNGRADE)
+
+    def _is_allow_reinstall(self, transaction_flags):
+        return self._has_flag(transaction_flags, TRANSACTION_FLAG_ALLOW_REINSTALL)
+
     def _is_only_trusted(self, transaction_flags):
         return self._has_flag(transaction_flags, TRANSACTION_FLAG_ONLY_TRUSTED)
 
@@ -457,8 +468,9 @@ class PackageKitPortageMixin(object):
         if self._is_installed(base):
             return True
         try:
-            if self.pvar.bindb.cpv_exists(base):
-                return True
+            if getattr(self.pvar, "_allow_binpkgs", False):
+                if self.pvar.bindb.cpv_exists(base):
+                    return True
         except Exception:
             pass
         return self.pvar.portdb.cpv_exists(base)
@@ -466,9 +478,34 @@ class PackageKitPortageMixin(object):
     def _is_binpkg(self, cpv):
         base = self._strip_buildid_for_db(cpv)
         try:
-            return self.pvar.bindb.cpv_exists(base)
+            if getattr(self.pvar, "_allow_binpkgs", False):
+                return self.pvar.bindb.cpv_exists(base)
+            return False
         except Exception:
             return False
+
+    def _is_strictly_newer_than_installed(self, cpv):
+        """
+        Return True if the given cpv is strictly newer than
+        the currently installed version(s) of the same package.
+        """     
+        try:
+            tcpv = self._strip_buildid_for_db(cpv)
+            cp, ver, rev = portage.versions.pkgsplit(tcpv)
+        except Exception:
+            self.error(ERROR_RESTRICTED_DOWNLOAD, "au")
+            return False
+            
+        installed_cpvs = self.pvar.vardb.match(cp)
+        if not installed_cpvs:
+            # nothing installed, so it's "newer" by definition
+            return True
+        
+        for inst_cpv in installed_cpvs: 
+            if self._cmp_cpv(tcpv, inst_cpv) > 0:
+                return False
+        
+        return True
 
 
     def _get_real_license_str(self, cpv, metadata):
@@ -620,40 +657,42 @@ class PackageKitPortageMixin(object):
 
         bids = set()
 
-        try:
-            package, version, rev = portage.versions.pkgsplit(base_cpv)
-            pn = package.split("/", 1)[1]
-            pf = pn + "-" + version
-            if rev != "r0":
-                pf = pf + "-r" + rev
-        except Exception:
-            self._buildid_cache[base_cpv] = []
-            return []
+        if getattr(self.pvar, "_allow_binpkgs", False):
+            try:
+                package, version, rev = portage.versions.pkgsplit(base_cpv)
+                pn = package.split("/", 1)[1]
+                pf = pn + "-" + version
+                if rev != "r0":
+                    pf = pf + "-r" + rev
+            except Exception:
+                self._buildid_cache[base_cpv] = []
+                return []
 
-        pkgdirs_raw = self.pvar.settings.get("PKGDIR", "") or ""
-        pkgdirs = pkgdirs_raw.split() if isinstance(pkgdirs_raw, str) else pkgdirs_raw
+            pkgdirs_raw = self.pvar.settings.get("PKGDIR", "") or ""
+            pkgdirs = pkgdirs_raw.split() if isinstance(pkgdirs_raw, str) else pkgdirs_raw
 
-        for pkgdir in pkgdirs:
-            cat, pn = package.split("/", 1)
-            candidate_dir = os.path.join(pkgdir, cat, pn)
-            if not os.path.isdir(candidate_dir):
-                continue
-            for fname in os.listdir(candidate_dir):
-                if not (fname.endswith((".tbz2", ".tbz", ".tb2", ".xpak", ".gpkg.tar"))):
+            for pkgdir in pkgdirs:
+                cat, pn = package.split("/", 1)
+                candidate_dir = os.path.join(pkgdir, cat, pn)
+                if not os.path.isdir(candidate_dir):
                     continue
-                if fname.startswith(pf + "-"):
-                    bid_str = fname[len(pf) + 1:].split(".")[0]
-                    if bid_str.isdigit():
-                        bids.add(int(bid_str))
+                for fname in os.listdir(candidate_dir):
+                    if not (fname.endswith((".tbz2", ".tbz", ".tb2", ".xpak", ".gpkg.tar"))):
+                        continue
+                    if fname.startswith(pf + "-"):
+                        bid_str = fname[len(pf) + 1:].split(".")[0]
+                        if bid_str.isdigit():
+                            bids.add(int(bid_str))
 
         try:
-            for cpv in self.pvar.bindb.match(base_cpv):
-                try:
-                    build_id_str = self.pvar.bindb.aux_get(cpv, ["BUILD_ID"])[0]
-                    if build_id_str and build_id_str.isdigit():
-                        bids.add(int(build_id_str))
-                except Exception:
-                    continue
+            if getattr(self.pvar, "_allow_binpkgs", False):
+                for cpv in self.pvar.bindb.match(base_cpv):
+                    try:
+                        build_id_str = self.pvar.bindb.aux_get(cpv, ["BUILD_ID"])[0]
+                        if build_id_str and build_id_str.isdigit():
+                            bids.add(int(build_id_str))
+                    except Exception:
+                        continue
         except Exception:
             # fall back: no bindb data
             pass
@@ -872,9 +911,10 @@ class PackageKitPortageMixin(object):
             for cp in self.pvar.portdb.cp_all():
                 if cp not in cp_list:
                     cp_list.append(cp)
-            for cp in self.pvar.bindb.cp_all():
-                if cp not in cp_list:
-                    cp_list.append(cp)
+            if getattr(self.pvar, "_allow_binpkgs", False):
+                for cp in self.pvar.bindb.cp_all():
+                    if cp not in cp_list:
+                        cp_list.append(cp)
 
         return cp_list
 
@@ -889,8 +929,10 @@ class PackageKitPortageMixin(object):
         installed_cpvs = list(self.pvar.vardb.match(cp))
         available_cpvs = [x for x in self.pvar.portdb.match(cp)
                           if not self._is_installed(x)]
-        bin_cpvs = [x for x in self.pvar.bindb.match(cp)
-                    if not self._is_installed(x)]
+        bin_cpvs = []
+        if getattr(self.pvar, "_allow_binpkgs", False):
+            bin_cpvs = [x for x in self.pvar.bindb.match(cp)
+                        if not self._is_installed(x)]
 
         if FILTER_INSTALLED in filters:
             cpv_list = installed_cpvs
@@ -899,7 +941,7 @@ class PackageKitPortageMixin(object):
         else:
             cpv_list = []
             cpv_list.extend(installed_cpvs)
-            for x in bin_cpvs + available_cpvs:
+            for x in available_cpvs + bin_cpvs:
                 if x not in cpv_list:
                     cpv_list.append(x)
 
@@ -1087,16 +1129,29 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
                 info = INFO_AVAILABLE
 
         prev_bid = getattr(self, "_selected_build_id", None)
+        limit_buildids = getattr(self, "_limit_buildids_to_latest", False)
 
         self._selected_build_id = None
-        self.package(self._cpv_to_id(cpv), info, desc)
 
-        # emit per-build-id entries for binpkgs
-        if self._is_binpkg(cpv) and not self._is_installed(cpv):
+        # If in "resolve/install" mode (limit_buildids true) and this package
+        # has binpkg buildids available, emit only the latest build id entry.
+        # If note keep the old behavior (base entry + per-build-id entries).
+        if limit_buildids and self._is_binpkg(cpv) and not self._is_installed(cpv):
             bids = self._list_binpkg_buildids(cpv)
-            for bid in bids:
-                self._selected_build_id = bid
+            if bids:
+                self._selected_build_id = max(bids)
                 self.package(self._cpv_to_id(cpv), info, desc)
+            else:
+                # fallback to normal single entry if no build IDs present
+                self.package(self._cpv_to_id(cpv), info, desc)
+        else:
+            self.package(self._cpv_to_id(cpv), info, desc)
+
+            if self._is_binpkg(cpv) and not self._is_installed(cpv):
+                bids = self._list_binpkg_buildids(cpv)
+                for bid in bids:
+                    self._selected_build_id = bid
+                    self.package(self._cpv_to_id(cpv), info, desc)
 
         self._selected_build_id = prev_bid
 
@@ -1528,11 +1583,13 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         only_trusted = self._is_only_trusted(transaction_flags)
         simulate = self._is_simulate(transaction_flags)
         only_download = self._is_only_download(transaction_flags)
+        allow_downgrade = self._is_allow_downgrade(transaction_flags)
+        allow_reinstall = self._is_allow_reinstall(transaction_flags)
 
         return self._install_packages(only_trusted, pkgs, simulate=simulate,
-                                      only_download=only_download)
+                                      only_download=only_download, downgrade=allow_downgrade, reinstall=allow_reinstall)
 
-    def _install_packages(self, only_trusted, pkgs, simulate=False, only_download=False):
+    def _install_packages(self, only_trusted, pkgs, simulate=False, only_download=False, downgrade=False, reinstall=False):
         """
         Install packages using the same depgraph + scheduler sequence as emerge.
         """
@@ -1546,10 +1603,15 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
             cpv = self._id_to_cpv(pkg)
             if not self._is_cpv_valid(cpv):
                 self.error(ERROR_PACKAGE_NOT_FOUND, f"Package {pkg} not found or not visible")
-                continue
-            if self._is_installed(cpv):
-                self.error(ERROR_PACKAGE_ALREADY_INSTALLED, f"Package {pkg} is already installed")
-                continue
+                continu
+            if not reinstall:
+                if self._is_installed(cpv):
+                    self.error(ERROR_PACKAGE_ALREADY_INSTALLED, f"Package {pkg} is already installed boy")
+                    continue
+            if not downgrade:
+                if self._is_strictly_newer_than_installed(cpv):
+                    self.error(ERROR_PACKAGE_NOT_FOUND, f"Package {pkg} Is a downgrade and not allowed")
+                    continue
             cpv_list.append("=" + cpv)
 
         if not cpv_list:
@@ -1558,10 +1620,6 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         if only_trusted:
             self.error(ERROR_MISSING_GPG_SIGNATURE, "Portage backend does not support GPG signature verification")
             return
-
-        from _emerge.main import parse_opts
-        import traceback
-        import shlex
 
         myopts = {}
 
@@ -1624,6 +1682,14 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
             myopts["--pretend"] = True
         if only_download:
             myopts["--fetchonly"] = True
+        if reinstall:
+            #myopts["--reinstall"] = True
+            pass
+        else:
+            myopts["--selective"] = "y"
+
+        if not downgrade:
+            myopts["--ignore-downgrade"] = "y"
 
         # resolve deps (first attempt)
         self.status(STATUS_DEP_RESOLVE)
@@ -1693,13 +1759,7 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         if simulate:
             return
 
-        os.environ.setdefault("PATH","/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/bin:/usr/lib/llvm/20/bin:/usr/lib/llvm/19/bin:/usr/lib/llvm/18/bin:/opt/vmware/bin:/opt/vmware/sbin:/etc/eselect/wine/bin:/opt/cuda/bin:/var/lib/snapd/snap/bin")
-        os.environ.setdefault("HOME", "/var/lib/portage")
-        os.environ.setdefault("USER", "portage")
-        os.environ.setdefault("LOGNAME", "portage")
-
         # run scheduler
-        import portage.elog
         portage.elog.add_listener(self._elog_listener)
         try:
             #self._block_output()
@@ -1811,9 +1871,6 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
 
         if not atoms:
             return
-
-        from _emerge.main import parse_opts
-        import shlex
 
         try:
             emerge_config = load_emerge_config()
@@ -1933,8 +1990,29 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
 
         for percentage, cp in zip(progress, cp_list):
             if s.match(cp):
-                for cpv in self._get_all_cpv(cp, filters):
-                    self._package(cpv)
+                cpv_list = self._get_all_cpv(cp, filters, filter_newest=False)
+
+                cpv_list = self._filter_free(cpv_list, filters)
+
+                tmp_filters = list(filters) if not isinstance(filters, list) else filters[:]
+                if FILTER_NEWEST not in tmp_filters:
+                    tmp_filters.append(FILTER_NEWEST)
+                cpv_list = self._filter_newest(cpv_list, tmp_filters)
+
+                if FILTER_NEWEST in filters:
+                    cpv_list = cpv_list[:1]
+
+                # suppress per-build-id expansion and emit only latest build id
+                self._limit_buildids_to_latest = True
+                try:
+                    for cpv in cpv_list:
+                        try:
+                            self._package(cpv)
+                        except InvalidAtom:
+                            continue
+                finally:
+                    # remove flag
+                    self._limit_buildids_to_latest = False
 
             self.percentage(percentage)
 
@@ -2172,7 +2250,6 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         if simulate:
             return
 
-        import portage.elog
         portage.elog.add_listener(self._elog_listener)
         try:
             mergetask = Scheduler(
