@@ -812,7 +812,11 @@ class PackageKitPortageMixin(object):
             size = self._get_metadata(cpv, ["SIZE"])[0]
             size = int(size) if size else 0
         else:
-            metadata = self._get_metadata(cpv, ["IUSE", "SLOT"], in_dict=True)
+            keys = ["EAPI", "IUSE", "SLOT", "repository", "KEYWORDS", "PROPERTIES", "RESTRICT"]
+            metadata = self._get_metadata(cpv, keys, in_dict=True)
+            for k in keys:
+                if k not in metadata or metadata[k] is None:
+                    metadata[k] = ""
 
             package = _emerge.Package.Package(
                 type_name="ebuild",
@@ -824,7 +828,8 @@ class PackageKitPortageMixin(object):
             )
             fetch_file = self.pvar.portdb.getfetchsizes(package[2],
                                                         package.use.enabled)
-            size = sum(fetch_file)
+            #size = sum(fetch_file)
+            size = sum(f[0] for f in fetch_file if isinstance(f[0], int))
 
         return size
 
@@ -1344,7 +1349,10 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         self.allow_cancel(True)
         self.percentage(0)
 
-        cp_list = self._get_all_cp(filters)
+        if FILTER_INSTALLED in filters:
+            cp_list = self.pvar.vardb.cp_all()
+        else:
+            cp_list = self._get_all_cp(filters)
         progress = PackagekitProgress(compute_equal_steps(cp_list))
 
         for percentage, cp in zip(progress, cp_list):
@@ -1479,6 +1487,10 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         # - free: ok
         # - newest: ok
 
+        # Need to include for the moment, might need to change behaviour later, but it seems nobody sets obvious flags anymore
+        if FILTER_NEWEST not in filters:
+            filters.append(FILTER_NEWEST)
+
         self.status(STATUS_INFO)
         self.allow_cancel(True)
         self.percentage(None)
@@ -1494,10 +1506,27 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
             for atom in sets:
                 update_candidates.append(atom.cp)
 
+        self.pvar.update()
+
+        import functools
+        cmp_key = functools.cmp_to_key(
+            lambda a, b: portage.versions.pkgcmp(
+                portage.versions.pkgsplit(a),
+                portage.versions.pkgsplit(b)
+            )
+        )
+
         # check if a candidate can be updated
         for cp in update_candidates:
             cpv_list_inst = self.pvar.vardb.match(cp)
             cpv_list_avai = self.pvar.portdb.match(cp)
+
+            if getattr(self.pvar, "_allow_binpkgs", False):
+                bin_list = sorted(self.pvar.bindb.match(cp), key=cmp_key)
+                cpv_list_avai = cpv_list_avai + [x for x in bin_list if x not in cpv_list_avai]
+
+            # IMPORTANT: sort the *entire* combined list
+            cpv_list_avai = sorted(cpv_list_avai, key=cmp_key)
 
             cpv_dict_inst = self._get_cpv_slotted(cpv_list_inst)
             cpv_dict_avai = self._get_cpv_slotted(cpv_list_avai)
@@ -2234,54 +2263,173 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         # only_trusted isn't supported
         # but better to show it after important errors
         if only_trusted:
-            self.error(ERROR_MISSING_GPG_SIGNATURE,"Portage backend does not support GPG signature")
-            return
+            # self.error(ERROR_MISSING_GPG_SIGNATURE,"Portage backend does not support GPG signature")
+            pass#return
 
         myopts = {}
+
+        try:
+            emerge_config = load_emerge_config()
+            tmpcmdline = []
+            tmpcmdline.extend(
+                shlex.split(
+                    emerge_config.target_config.settings.get("EMERGE_DEFAULT_OPTS", "")
+                )
+            )
+            # parse defaults like emerge does
+            emerge_config.action, emerge_config.opts, emerge_config.args = parse_opts(tmpcmdline)
+            self.pvar.settings = emerge_config.target_config.settings
+            myopts = emerge_config.opts
+        except BaseException as e:
+            self.error(ERROR_PACKAGE_FAILED_TO_INSTALL, f"parse_opts exploded: {type(e).__name__}: {e}")
+
+        myopts["--with-bdeps"] = "y"
+
+        getbin = bool(myopts.get("--getbinpkg"))
+        getbinonly = bool(myopts.get("--getbinpkgonly"))
+
+        # both flags set -> error and stop
+        if getbin and getbinonly:
+            self.error(ERROR_DEP_RESOLUTION_FAILED, "Invalid options: both --getbinpkg and --getbinpkgonly are set.")
+            return
+
+        root = self.pvar.settings['ROOT']
+        bintree = self.pvar.trees[root].get('bintree')
+
+        if getbin:
+            myopts["--usepkg"] = True
+            myopts.pop("--getbinpkgonly", None)
+            if bintree:
+                try:
+                    bintree.populate(getbinpkgs=True)
+                except Exception as e:
+                    # not fatal: scheduler will fall back to source if needed
+                    self.message(MESSAGE_INFO, f"bintree.populate(getbinpkg) failed: {e}")
+
+        elif getbinonly:
+            myopts["--usepkgonly"] = True
+            myopts.pop("--getbinpkg", None)
+            if bintree:
+                try:
+                    bintree.populate(getbinpkgs=True, getbinpkgonly=True)
+                except Exception as e:
+                    # fatal: only binpkgs
+                    self.error(ERROR_PACKAGE_FAILED_TO_INSTALL, f"No binary packages available: {e}")
+                    return
+        else:
+            # neither flag
+            myopts.pop("--getbinpkg", None)
+            myopts.pop("--getbinpkgonly", None)
+            myopts.pop("--usepkg", None)
+            myopts.pop("--usepkgonly", None)
+
         if simulate:
             myopts["--pretend"] = True
         if only_download:
             myopts["--fetchonly"] = True
+        else:
+            myopts["--selective"] = "y"
 
+        # resolve deps (first attempt)
         self.status(STATUS_DEP_RESOLVE)
-        myparams = create_depgraph_params(myopts, "upgrade")
+        myparams = create_depgraph_params(myopts, "")
         dep = depgraph(self.pvar.settings, self.pvar.trees, myopts, myparams, None)
 
         retval, favorites = dep.select_files(cpv_list)
         if not retval:
-            self.error(ERROR_DEP_RESOLUTION_FAILED, "Wasn't able to get update depgraph")
+            self.error(ERROR_DEP_RESOLUTION_FAILED, "Wasn't able to get dependency graph")
             return
 
         altlist = dep.altlist()
+        try:
+            alt_cpvs = [getattr(x, "cpv", str(x)) for x in altlist]
+            self.message(MESSAGE_INFO, f"dep.altlist: {alt_cpvs}")
+            self.message(MESSAGE_INFO, f"favorites: {favorites}")
+        except Exception:
+            pass
+
         if not altlist:
-            self.error(ERROR_DEP_RESOLUTION_FAILED, f"Empty update list for {cpv_list}")
-            return
+            if getbinonly:
+                self.error(ERROR_DEP_RESOLUTION_FAILED,
+                        "No binary candidates found and --getbinpkgonly was requested; aborting.")
+                return
+            elif getbin:
+                try:
+                    self.message(MESSAGE_INFO, "No binary candidates found; falling back to source builds.")
+                except Exception:
+                    pass
 
-        #self.message(MESSAGE_INFO, f"About to update: {[x.cpv for x in altlist]}")
+                myopts_fallback = dict(myopts)
+                myopts_fallback.pop("--usepkg", None)
+                myopts_fallback.pop("--usepkgonly", None)
 
+                # re-create depgraph and re-resolve
+                myparams_fb = create_depgraph_params(myopts_fallback, "")
+                dep_fb = depgraph(self.pvar.settings, self.pvar.trees, myopts_fallback, myparams_fb, None)
+                retval2, favorites2 = dep_fb.select_files(cpv_list)
+                if not retval2:
+                    self.error(ERROR_DEP_RESOLUTION_FAILED, "Wasn't able to get dependency graph (fallback to source).")
+                    return
+
+                altlist = dep_fb.altlist()
+                try:
+                    alt_cpvs = [getattr(x, "cpv", str(x)) for x in altlist]
+                    self.message(MESSAGE_INFO, f"dep.altlist (fallback): {alt_cpvs}")
+                    self.message(MESSAGE_INFO, f"favorites (fallback): {favorites2}")
+                except Exception:
+                    pass
+
+                if not altlist:
+                    self.error(ERROR_DEP_RESOLUTION_FAILED, "Resolver produced an empty merge list for: " + ", ".join(cpv_list))
+                    return
+
+                dep = dep_fb
+                favorites = favorites2
+            else:
+                self.error(ERROR_DEP_RESOLUTION_FAILED, "Resolver produced an empty merge list for: " + ", ".join(cpv_list))
+                return
+
+        self.message("info", f"About to merge: {[getattr(x,'cpv',x) for x in altlist]}")
+
+        # fetch restrictions
         self._check_fetch_restrict(altlist)
 
         self.status(STATUS_INSTALL)
         if simulate:
             return
 
+        # run scheduler
         portage.elog.add_listener(self._elog_listener)
         try:
+            #self._block_output()
             mergetask = Scheduler(
                 self.pvar.settings, self.pvar.trees, self.pvar.mtimedb,
-                myopts, None, altlist, favorites,
+                myopts, None, dep.altlist(), favorites,
                 dep.schedulerGraph()
             )
             rval = mergetask.merge()
         finally:
+            #self._unblock_output()
             portage.elog.remove_listener(self._elog_listener)
 
-        if rval != os.EX_OK:
+        # refresh portage internal state
+        try:
+            self.pvar.update()
+        except Exception:
+            self.message("info", "Warning: failed to refresh internal portage state")
+
+        # validate result
+        for entry in self._elog_messages:
+            try:
+                self.message(MESSAGE_INFO, str(entry))
+            except Exception:
+                pass
+        installed_ok = all(self._is_installed(cpv.lstrip('=')) for cpv in cpv_list)
+        if rval != os.EX_OK and not installed_ok:
             self._send_merge_error(ERROR_PACKAGE_FAILED_TO_INSTALL)
 
         self._elog_messages = []
         self._signal_config_update()
-        self.pvar.update()
 
 def main():
     backend = PackageKitPortageBackend("")
