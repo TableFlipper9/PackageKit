@@ -34,6 +34,7 @@ pk_backend_start_job (PkBackend *backend, PkBackendJob *job)
 		pk_backend_job_error_code (job,
 					   PK_ERROR_ENUM_LOCK_REQUIRED,
 					   "spawned backend requires lock");
+		pk_backend_job_finished (job);
 		return;
 	}
 }
@@ -94,7 +95,7 @@ pk_backend_get_groups (PkBackend *backend)
 			//PK_GROUP_ENUM_COLLECTIONS,
 			//PK_GROUP_ENUM_VENDOR,
 			//PK_GROUP_ENUM_NEWEST,
-			//PK_GROUP_ENUM_UNKNOWN,
+			PK_GROUP_ENUM_UNKNOWN,
 			-1);
 }
 
@@ -131,11 +132,11 @@ pk_backend_get_roles (PkBackend *backend)
 	PK_ROLE_ENUM_GET_UPDATES,
 	PK_ROLE_ENUM_GET_UPDATE_DETAIL,
 	PK_ROLE_ENUM_INSTALL_PACKAGES,
-	//PK_ROLE_ENUM_INSTALL_FILES,
+	PK_ROLE_ENUM_INSTALL_FILES,
 	//PK_ROLE_ENUM_INSTALL_SIGNATURE,
 	PK_ROLE_ENUM_REFRESH_CACHE,
 	PK_ROLE_ENUM_REMOVE_PACKAGES,
-	//PK_ROLE_ENUM_DOWNLOAD_PACKAGES,
+	PK_ROLE_ENUM_DOWNLOAD_PACKAGES,
 	PK_ROLE_ENUM_RESOLVE,
 	PK_ROLE_ENUM_SEARCH_DETAILS,
 	PK_ROLE_ENUM_SEARCH_FILE,
@@ -178,6 +179,13 @@ pk_backend_depends_on (PkBackend *backend, PkBackendJob *job, PkBitfield filters
 }
 
 void
+pk_backend_get_distro_upgrades(PkBackend *backend, PkBackendJob *job)
+{
+    pk_backend_job_distro_upgrade(job, PK_DISTRO_UPGRADE_ENUM_STABLE, "Gentoo 2025",  "gentoo-2025");
+    pk_backend_job_finished(job);
+}
+
+void
 pk_backend_get_details (PkBackend *backend, PkBackendJob *job, gchar **package_ids)
 {
 	gchar *package_ids_temp;
@@ -211,6 +219,7 @@ void
 pk_backend_get_updates (PkBackend *backend, PkBackendJob *job, PkBitfield filters)
 {
 	gchar *filters_text;
+	g_debug("portage backend: pk_backend_get_updates called, filters=%s", filters_text);
 
 	filters_text = pk_filter_bitfield_to_string (filters);
 	pk_backend_spawn_helper (spawn, job, BACKEND_FILE, "get-updates", filters_text, NULL);
@@ -233,7 +242,9 @@ pk_backend_install_packages (PkBackend *backend, PkBackendJob *job, PkBitfield t
 	/* send the complete list as stdin */
 	package_ids_temp = pk_package_ids_to_string (package_ids);
 	transaction_flags_temp = pk_transaction_flag_bitfield_to_string (transaction_flags);
+
 	pk_backend_spawn_helper (spawn, job, BACKEND_FILE, "install-packages", transaction_flags_temp, package_ids_temp, NULL);
+
 	g_free(transaction_flags_temp);
 	g_free (package_ids_temp);
 }
@@ -351,6 +362,7 @@ void
 pk_backend_get_packages (PkBackend *backend, PkBackendJob *job, PkBitfield filters)
 {
 	gchar *filters_text;
+	g_debug("portage backend: pk_backend_get_packages called, filters=%s", filters_text);
 
 	filters_text = pk_filter_bitfield_to_string (filters);
 	pk_backend_spawn_helper (spawn, job, BACKEND_FILE, "get-packages", filters_text, NULL);
@@ -395,5 +407,5 @@ pk_backend_get_author (PkBackend *backend)
 gboolean
 pk_backend_supports_parallelization (PkBackend *backend)
 {
-	return TRUE;
+	return FALSE;
 }
