@@ -106,6 +106,7 @@ pk_backend_get_filters (PkBackend *backend)
 			PK_FILTER_ENUM_INSTALLED,
 			PK_FILTER_ENUM_FREE,
 			PK_FILTER_ENUM_NEWEST,
+			PK_FILTER_ENUM_APPLICATION,
 			-1);
 	/*
 	 * These filters are candidate for further add:
@@ -252,14 +253,11 @@ pk_backend_install_packages (PkBackend *backend, PkBackendJob *job, PkBitfield t
 void
 pk_backend_refresh_cache (PkBackend *backend, PkBackendJob *job, gboolean force)
 { 
-	/* check network state */
 	if (!pk_backend_is_online (backend)) {
-		pk_backend_job_error_code (job, PK_ERROR_ENUM_NO_NETWORK, "Cannot refresh cache whilst offline");
-		pk_backend_job_finished (job);
-		return;
-	}
+        g_debug("portage backend: pk_backend_is_online() == FALSE, allowing refresh to proceed (let backend handle network errors)");
+    }
 
-	pk_backend_spawn_helper (spawn, job, BACKEND_FILE, "refresh-cache", pk_backend_bool_to_string (force), NULL);
+    pk_backend_spawn_helper (spawn, job, BACKEND_FILE, "refresh-cache", pk_backend_bool_to_string (force), NULL);
 }
 
 void
