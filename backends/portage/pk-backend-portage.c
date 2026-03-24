@@ -2,6 +2,7 @@
  *
  * Copyright (C) 2009 Mounir Lamouri (volkmar) <mounir.lamouri@gmail.com>
  * Copyright (C) 2010-2013 Fabio Erculiani (lxnay) <lxnay@gentoo.org>
+ * Copyright (C) 2025-2026 Mihai Morovan <hithack9@gmail.com>
  *
  * Licensed under the GNU General Public License Version 2
  *
@@ -399,7 +400,7 @@ pk_backend_get_description (PkBackend *backend)
 const gchar *
 pk_backend_get_author (PkBackend *backend)
 {
-    return "Mounir Lamouri (volkmar) <mounir.lamouri@gmail.com>, Fabio Erculiani <lxnay@sabayon.org>";
+    return "Mounir Lamouri (volkmar) <mounir.lamouri@gmail.com>, Fabio Erculiani <lxnay@sabayon.org>, Mihai Morovan <hithack9@gmail.com>";
 }
 
 gboolean

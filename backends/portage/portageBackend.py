@@ -4,6 +4,7 @@
 #
 # Copyright (C) 2009 Mounir Lamouri (volkmar) <mounir.lamouri@gmail.com>
 # Copyright (C) 2010-2013 Fabio Erculiani (lxnay) <lxnay@gentoo.org>
+# Copyright (C) 2025-2026 Mihai Morovan <hithack9@gmail.com>
 #
 # Licensed under the GNU General Public License Version 2
 #
@@ -200,6 +201,7 @@ class PortageBridge():
         os.environ.setdefault("LOGNAME", "portage")
 
     def handle_binpkg(self):
+        # TODO: return whole metadata correctly for remote binpkgs 
         try:
             emerge_config = load_emerge_config()
             tmpcmdline = []
@@ -2063,7 +2065,7 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         self.percentage(100)
 
     def search_details(self, filters, keys):
-        # NOTES: very bad performance
+
         self.status(STATUS_QUERY)
         self.allow_cancel(True)
 
@@ -2073,40 +2075,85 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         progress = PackagekitProgress(compute_equal_steps(cp_list))
         self.percentage(progress.percent)
 
+        portdb = self.pvar.portdb
+
+        # metadata cache locations
+        repo_paths = portdb.porttrees
+
         for percentage, cp in zip(progress, cp_list):
-            # unfortunatelly, everything is related to cpv, not cp
-            # can't filter cp
-            cpv_list = []
+            match = False
 
-            # newest filter can't be executed now
-            # because some cpv are going to be filtered by search conditions
-            # and newest filter could be alterated
-            for cpv in self._get_all_cpv(cp, filters, filter_newest=False):
-                match = True
-                metadata = self._get_metadata(
-                    cpv, ["DESCRIPTION", "HOMEPAGE", "IUSE", "LICENSE",
-                          "repository", "SLOT", "EAPI", "KEYWORDS"],
-                    in_dict=True
-                )
-                # update LICENSE to correspond to system settings
-                metadata["LICENSE"] = self._get_real_license_str(cpv, metadata)
-                for s in search_list:
-                    found = False
-                    for x in metadata:
-                        if s.search(metadata[x]):
-                            found = True
-                            break
-                    if not found:
-                        match = False
+            # Split category/package
+            try:
+                cat, pkg = cp.split("/")
+            except ValueError:
+                self.percentage(percentage)
+                continue
+
+            text = cp
+
+            try:
+                for repo in repo_paths:
+
+                    cache_dir = f"{repo}/metadata/md5-cache/{cat}"
+
+                    if not os.path.isdir(cache_dir):
+                        continue
+
+                    # find first package cache entry
+                    for fname in os.listdir(cache_dir):
+
+                        if not fname.startswith(pkg + "-"): continue
+
+                        path = f"{cache_dir}/{fname}"
+
+                        try:
+
+                            with open(path, "r") as f:
+
+                                for line in f:
+
+                                    if line.startswith("DESCRIPTION="):
+                                        text += " " + line[12:].strip()
+
+                                    elif line.startswith("HOMEPAGE="):
+                                        text += " " + line[9:].strip()
+
+                                    if len(text) > 500:
+                                        break
+
+                        except Exception:
+                            continue
+
                         break
-                if match:
-                    cpv_list.append(cpv)
 
-            # newest filter
-            cpv_list = self._filter_newest(cpv_list, filters)
+                    if len(text) > len(cp):
+                        break
 
-            for cpv in cpv_list:
-                self._package(cpv)
+
+            except Exception:
+                self.percentage(percentage)
+                continue
+
+            #search
+            for s in search_list:
+                if not s.search(text):
+                    break
+            else:
+                match = True
+
+
+           #expand match
+            if match:
+                cpv_all = self._get_all_cpv(cp, filters, filter_newest=False)
+                cpv_list = self._filter_newest(cpv_all, filters)
+
+                for cpv in cpv_list:
+
+                    try:
+                        self._package(cpv)
+                    except InvalidAtom:
+                        continue
 
             self.percentage(percentage)
 
@@ -2244,6 +2291,7 @@ class PackageKitPortageBackend(PackageKitPortageMixin, PackageKitBaseBackend):
         # TODO: manage config file updates
         # TODO: every updated pkg should emit self.package()
         #       see around _emerge.Scheduler.Scheduler
+        # TODO: return only the latest binpkg
 
         self.status(STATUS_RUNNING)
         self.allow_cancel(False)
